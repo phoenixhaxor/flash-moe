@@ -33,3 +33,4 @@ c4b2795	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.28	9184	26.9	keep	batch-experts 200t
 5619b18	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.20	3591	13.2	keep	10GB cache sweep - 43% hit, 13.2GB RAM
 5619b18	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.33	3633	21.5	keep	20GB cache sweep - 54% hit, 21.5GB RAM
 b52d187	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.05	3068	5.9	keep	packed layers 0-8 + no-cache - 6.6-7.5 GB/s packed vs 5.3 scattered (25% faster)
+a5a969f	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.49	2712	5.5	keep	ALL 60 layers packed + no-cache + K=4 - I/O 205ms, 240 seeks, 3.5GB/s, BEST
