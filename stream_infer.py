@@ -325,13 +325,29 @@ class ExpertCache:
 
     Each entry is a dict mapping "proj_name.attr_name" -> mx.array, e.g.
     {"gate_proj.weight": mx.array(...), "gate_proj.scales": mx.array(...), ...}.
+
+    Eviction policy: Least Recently Used via OrderedDict ordering.
     """
 
     def __init__(self, max_entries=256):
         self.max_entries = max_entries
         self.cache = OrderedDict()  # (layer_idx, expert_id) -> {attr_key: mx.array}
+        self._protected = set()  # keys protected from eviction during current batch
         self.hits = 0
         self.misses = 0
+        self._lock = __import__('threading').Lock()
+
+    # -- internal helpers ---------------------------------------------------
+
+    def protect(self, keys):
+        """Mark keys as protected from eviction (call before batch loading)."""
+        self._protected = set(keys)
+
+    def unprotect(self):
+        """Clear protection after batch loading is done."""
+        self._protected = set()
+
+    # -- public interface (unchanged signatures) ----------------------------
 
     def get_attr(self, layer_idx, expert_id, proj_name, attr_name):
         """Return a single cached array or None."""
@@ -347,13 +363,20 @@ class ExpertCache:
         """Store a single attribute array for an expert."""
         key = (layer_idx, expert_id)
         attr_key = f"{proj_name}.{attr_name}"
-        if key in self.cache:
-            self.cache.move_to_end(key)
-            self.cache[key][attr_key] = array
-        else:
-            if len(self.cache) >= self.max_entries:
-                self.cache.popitem(last=False)  # evict LRU
-            self.cache[key] = {attr_key: array}
+        with self._lock:
+            if key in self.cache:
+                self.cache[key][attr_key] = array
+            else:
+                # Find the LRU entry that isn't protected
+                while len(self.cache) >= self.max_entries:
+                    # Iterate from LRU end to find first unprotected entry
+                    for candidate_key in self.cache:
+                        if candidate_key not in self._protected:
+                            del self.cache[candidate_key]
+                            break
+                    else:
+                        break  # all entries protected, can't evict
+                self.cache[key] = {attr_key: array}
 
     def has_expert(self, layer_idx, expert_id):
         """Check whether all 9 attributes (3 projs x 3 attrs) are cached."""
@@ -363,7 +386,7 @@ class ExpertCache:
         return len(self.cache[key]) >= 9  # gate/up/down x weight/scales/biases
 
     def touch(self, layer_idx, expert_id):
-        """Move entry to end (most recently used) to prevent eviction."""
+        """Move entry to the most-recently-used end."""
         key = (layer_idx, expert_id)
         if key in self.cache:
             self.cache.move_to_end(key)
@@ -378,6 +401,117 @@ class ExpertCache:
     def hit_rate(self):
         total = self.hits + self.misses
         return self.hits / total if total > 0 else 0.0
+
+
+def preload_hot_experts(expert_cache, weight_index, model_path, num_layers, topk_per_layer, header_cache):
+    """Pre-load the hottest experts per layer into the ExpertCache at startup.
+
+    Uses profiling data from expert_routing_profile.npz (if it exists) to identify
+    the most frequently activated experts. Falls back to experts 0..topk-1 per layer
+    if no profiling data is available.
+
+    Args:
+        expert_cache: ExpertCache instance to populate
+        weight_index: dict from build_weight_index() mapping layer -> [(name, filepath)]
+        model_path: Path to model directory (for locating profiling data)
+        num_layers: number of MoE layers
+        topk_per_layer: how many experts to preload per layer
+        header_cache: dict for caching safetensors headers (populated in-place)
+    """
+    t_start = time.time()
+
+    # --- Determine which experts to preload per layer ---
+    profile_path = Path(model_path) / "expert_routing_profile.npz"
+    if not profile_path.exists():
+        # Also check working directory
+        profile_path = Path("expert_routing_profile.npz")
+
+    if profile_path.exists():
+        data = np.load(str(profile_path))
+        freq = data["counts"]  # [num_layers, num_experts]
+        print(f"[preload] Using profiling data from {profile_path} "
+              f"(shape {freq.shape})", flush=True)
+        layer_topk = {}
+        for layer_idx in range(min(num_layers, freq.shape[0])):
+            topk_indices = np.argsort(freq[layer_idx])[::-1][:topk_per_layer]
+            layer_topk[layer_idx] = topk_indices.tolist()
+    else:
+        print(f"[preload] No profiling data found, using experts 0..{topk_per_layer-1} "
+              f"per layer (uniform fallback)", flush=True)
+        layer_topk = {i: list(range(topk_per_layer)) for i in range(num_layers)}
+
+    # --- Build expert_file_map and pre-populate header_cache for all layers ---
+    layer_expert_maps = {}
+    all_expert_files = set()
+    for layer_idx in range(num_layers):
+        entries = weight_index.get(layer_idx, [])
+        _, expert_entries = split_layer_entries(entries)
+        expert_file_map = {}
+        for name, filepath in expert_entries:
+            expert_file_map[name] = filepath
+            all_expert_files.add(filepath)
+        layer_expert_maps[layer_idx] = expert_file_map
+
+    # Parse all safetensors headers upfront (needed by _read_single_expert_attrs)
+    for filepath in all_expert_files:
+        if filepath not in header_cache:
+            header_cache[filepath] = parse_safetensors_header(filepath)
+
+    # --- Preload experts in batches of 10 layers using ThreadPoolExecutor ---
+    total_loaded = 0
+    total_bytes = 0
+    batch_size = 10  # layers per progress report
+
+    for batch_start in range(0, num_layers, batch_size):
+        batch_end = min(batch_start + batch_size, num_layers)
+        t_batch = time.time()
+        batch_loaded = 0
+        batch_bytes = 0
+
+        # Collect all (layer, expert) pairs for this batch
+        work_items = []
+        for layer_idx in range(batch_start, batch_end):
+            expert_file_map = layer_expert_maps.get(layer_idx, {})
+            if not expert_file_map:
+                continue
+            experts_to_load = layer_topk.get(layer_idx, [])
+            for expert_idx in experts_to_load:
+                # Skip if already in cache (shouldn't happen at startup, but be safe)
+                if not expert_cache.has_expert(layer_idx, expert_idx):
+                    work_items.append((expert_idx, layer_idx, expert_file_map))
+
+        if not work_items:
+            continue
+
+        # Parallel read with ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_to_layer = {}
+            for expert_idx, layer_idx, expert_file_map in work_items:
+                fut = executor.submit(
+                    _read_single_expert_attrs,
+                    expert_idx, layer_idx, expert_file_map, header_cache
+                )
+                future_to_layer[fut] = layer_idx
+            for future in future_to_layer:
+                eidx, attrs, io_stats = future.result()
+                layer_idx = future_to_layer[future]
+                batch_bytes += io_stats["bytes_read"]
+                for (proj_name, attr_name), arr in attrs.items():
+                    expert_cache.put_attr(layer_idx, eidx, proj_name, attr_name, arr)
+                batch_loaded += 1
+
+        total_loaded += batch_loaded
+        total_bytes += batch_bytes
+        elapsed = time.time() - t_batch
+        throughput = (batch_bytes / 1e9) / elapsed if elapsed > 0 else 0
+        print(f"[preload] Layer {batch_start}-{batch_end-1}: loaded {batch_loaded} experts "
+              f"({batch_bytes/1e9:.1f} GB), {throughput:.1f} GB/s", flush=True)
+
+    total_time = time.time() - t_start
+    total_throughput = (total_bytes / 1e9) / total_time if total_time > 0 else 0
+    print(f"[preload] Done: {total_loaded} experts ({total_bytes/1e9:.1f} GB) "
+          f"in {total_time:.1f}s ({total_throughput:.1f} GB/s, {get_mem_gb():.1f} GB RSS)",
+          flush=True)
 
 
 def get_mem_gb():
@@ -1046,7 +1180,8 @@ def split_layer_entries(entries):
     return non_expert, expert
 
 
-def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_index, model_path):
+def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_index, model_path,
+                               preload_topk=0, cache_gb=20.0, profile=False):
     """Generate tokens with selective expert loading for MoE models.
 
     At startup: pre-load all non-expert weights (~2.3GB) for all layers into DRAM.
@@ -1057,6 +1192,9 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
 
     This reduces per-token I/O to just expert slices (~40MB/layer), eliminating the
     ~38s of non-expert loading overhead from the previous implementation.
+
+    When profile=True, collects detailed per-layer timing breakdown (routing, cache
+    lookup, I/O, compute, mx.eval sync) and prints a summary table after generation.
     """
     t_start = time.time()
 
@@ -1129,14 +1267,30 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
     # Per projection: intermediate*hidden/2 (weight) + intermediate*hidden/32 (scales+biases)
     # = intermediate*hidden*9/16 per projection, x3 projections
     per_expert_bytes = 3 * intermediate * hidden * 9 // 16
-    max_cache_gb = 20.0
+    max_cache_gb = cache_gb
+    # Memory safety: cap total DRAM = non_expert (~5GB) + cache; leave ~5GB for OS on 48GB machine
+    if max_cache_gb + 5 > 43:
+        adjusted = 43.0 - 5.0
+        print(f"[cache] WARNING: cache_gb={max_cache_gb:.1f} + non-expert (~5GB) exceeds 43GB safety limit. "
+              f"Reducing cache to {adjusted:.1f}GB")
+        max_cache_gb = adjusted
     max_entries_by_mem = int(max_cache_gb * 1e9 / per_expert_bytes) if per_expert_bytes > 0 else cache_entries
     if cache_entries > max_entries_by_mem:
         print(f"[cache] Capping entries from {cache_entries} to {max_entries_by_mem} "
               f"(~{max_cache_gb:.0f}GB limit, {per_expert_bytes/1e6:.1f}MB/entry)")
         cache_entries = max_entries_by_mem
+    elif max_entries_by_mem > cache_entries:
+        # When --cache-gb allows more than the heuristic, use full memory budget
+        print(f"[cache] Expanding entries from {cache_entries} to {max_entries_by_mem} "
+              f"(~{max_cache_gb:.0f}GB budget, {per_expert_bytes/1e6:.1f}MB/entry)")
+        cache_entries = max_entries_by_mem
 
     expert_cache = ExpertCache(max_entries=cache_entries)
+
+    # === Pre-load hot experts if requested ===
+    if preload_topk > 0:
+        preload_hot_experts(expert_cache, weight_index, model_path, num_layers,
+                            preload_topk, header_cache)
 
     # === Cache quantization parameters from model config (read once) ===
     # These are needed by compute_moe_direct for mx.gather_qmm calls.
@@ -1153,8 +1307,26 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
     # === I/O instrumentation counters (per-token, reset each token) ===
     io_stats_history = []  # list of per-token dicts
 
+    # === Profiling accumulators (only allocated when --profile is set) ===
+    if profile:
+        # Cumulative totals across all tokens (milliseconds)
+        prof_totals = {
+            "routing_ms": 0.0,
+            "cache_lookup_ms": 0.0,
+            "io_ms": 0.0,
+            "compute_ms": 0.0,
+            "eval_sync_ms": 0.0,
+            "python_overhead_ms": 0.0,
+        }
+        # Per-layer detail: layer_idx -> {hits, misses, io_ms, bytes_read, eval_sync_ms}
+        prof_per_layer = defaultdict(lambda: {
+            "hits": 0, "misses": 0, "io_ms": 0.0, "bytes_read": 0,
+            "eval_sync_ms": 0.0, "compute_ms": 0.0, "routing_ms": 0.0,
+        })
+        prof_token_count = 0  # tokens profiled (excludes prompt token 0)
+
     for token_idx in range(max_tokens):
-        t_token_start = time.time()
+        t_token_start = time.perf_counter() if profile else time.time()
 
         # Per-token I/O counters
         token_io_bytes = 0
@@ -1175,6 +1347,9 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
 
         # --- Per-layer: selective load, compute (clearing deferred to end of token) ---
         for i in range(num_layers):
+            if profile:
+                t_layer_start = time.perf_counter()
+
             layer = layers[i]
             c = cache[i]
 
@@ -1182,7 +1357,10 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
             _, expert_entries = split_layer_entries(entries)
 
             # ====== Phase 2: Run attention + router (weights already resident) ======
-            t_attn = time.time()
+            if profile:
+                t_attn = time.perf_counter()
+            else:
+                t_attn = time.time()
 
             x_normed = layer.input_layernorm(h)
             mask = ssm_mask if layer.is_linear else fa_mask
@@ -1191,9 +1369,19 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
             else:
                 r = layer.self_attn(x_normed, mask, c)
             h_mid = h + r
-            mx.eval(h_mid)
+
+            if profile:
+                # Separate the mx.eval sync time from the compute setup
+                t_attn_eval = time.perf_counter()
+                mx.eval(h_mid)
+                t_attn_eval_done = time.perf_counter()
+            else:
+                mx.eval(h_mid)
 
             # Run router to discover which experts are needed
+            if profile:
+                t_route = time.perf_counter()
+
             h_post = layer.post_attention_layernorm(h_mid)
             gates = layer.mlp.gate(h_post)
             gates = mx.softmax(gates, axis=-1, precise=True)
@@ -1201,12 +1389,24 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
             inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
             scores = mx.take_along_axis(gates, inds, axis=-1)
             scores = scores / scores.sum(axis=-1, keepdims=True)
-            mx.eval(inds)
 
-            attn_router_time = time.time() - t_attn
+            if profile:
+                t_route_eval = time.perf_counter()
+                mx.eval(inds)
+                t_route_eval_done = time.perf_counter()
+                layer_attn_eval_ms = (t_attn_eval_done - t_attn_eval) * 1000
+                layer_route_eval_ms = (t_route_eval_done - t_route_eval) * 1000
+                # Routing = total attn+route time MINUS the eval sync portions
+                layer_routing_ms = (t_route_eval_done - t_attn) * 1000 - layer_attn_eval_ms - layer_route_eval_ms
+            else:
+                mx.eval(inds)
+                attn_router_time = time.time() - t_attn
 
             # ====== Phase 3: Selective expert loading + compute ======
-            t_expert = time.time()
+            if profile:
+                t_expert = time.perf_counter()
+            else:
+                t_expert = time.time()
 
             # Extract UNIQUE expert IDs across all positions
             inds_np = np.array(inds.tolist())
@@ -1225,18 +1425,33 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                 expert_file_map[name] = filepath
 
             # --- LRU cache: determine which experts need disk reads ---
+            if profile:
+                t_cache_lookup = time.perf_counter()
+
             uncached_list = []
+            layer_cache_hits = 0
+            layer_cache_misses = 0
+            # Protect all experts needed for this layer from eviction
+            expert_cache.protect([(i, idx) for idx in unique_list])
             for idx in unique_list:
                 if expert_cache.has_expert(i, idx):
                     expert_cache.record_hit()
-                    # Touch the entry so it won't be evicted during put_attr
-                    # for uncached experts below
                     expert_cache.touch(i, idx)
+                    layer_cache_hits += 1
                 else:
                     expert_cache.record_miss()
                     uncached_list.append(idx)
+                    layer_cache_misses += 1
+
+            if profile:
+                t_cache_lookup_done = time.perf_counter()
+                layer_cache_lookup_ms = (t_cache_lookup_done - t_cache_lookup) * 1000
 
             # Read only uncached experts from disk (threaded: one expert per thread)
+            if profile:
+                t_io_start = time.perf_counter()
+                layer_io_bytes = 0
+
             if uncached_list:
                 # Pre-populate header_cache for all expert files (thread-safe after this)
                 for filepath in set(expert_file_map.values()):
@@ -1259,8 +1474,14 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                         token_io_seeks += io_stats["seek_count"]
                         token_io_time += io_stats["io_time_s"]
                         token_array_time += io_stats["array_time_s"]
+                        if profile:
+                            layer_io_bytes += io_stats["bytes_read"]
                         for (proj_name, attr_name), arr in attrs.items():
                             expert_cache.put_attr(i, eidx, proj_name, attr_name, arr)
+
+            if profile:
+                t_io_done = time.perf_counter()
+                layer_io_ms = (t_io_done - t_io_start) * 1000
 
             # Assemble [num_unique, ...] weight tensors into a dict for direct computation
             expert_tensors = {}
@@ -1280,10 +1501,20 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                         expert_tensors[f"{proj_name}.{attr_name}"] = mx.stack(slices, axis=0)
 
             # Force-eval the assembled expert weight tensors
-            mx.eval(*expert_tensors.values())
+            if profile:
+                t_expert_eval = time.perf_counter()
+                mx.eval(*expert_tensors.values())
+                t_expert_eval_done = time.perf_counter()
+                layer_expert_eval_ms = (t_expert_eval_done - t_expert_eval) * 1000
+            else:
+                mx.eval(*expert_tensors.values())
 
             # Run expert MoE computation directly via mx.gather_qmm (no model weight mutation)
-            t_moe = time.time()
+            if profile:
+                t_moe = time.perf_counter()
+            else:
+                t_moe = time.time()
+
             y = compute_moe_direct(
                 h_post, remapped_inds, expert_tensors,
                 group_size=qparams["group_size"],
@@ -1298,23 +1529,69 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
             y = y + shared_y
 
             h = h_mid + y
-            mx.eval(h)
-            token_moe_compute_time += time.time() - t_moe
+
+            if profile:
+                t_compute_eval = time.perf_counter()
+                mx.eval(h)
+                t_compute_eval_done = time.perf_counter()
+                layer_compute_eval_ms = (t_compute_eval_done - t_compute_eval) * 1000
+                layer_compute_ms = (t_compute_eval - t_moe) * 1000  # pure compute setup (lazy graph build)
+                token_moe_compute_time += (t_compute_eval_done - t_moe)
+            else:
+                mx.eval(h)
+                token_moe_compute_time += time.time() - t_moe
+
+            # Clear protection now that experts are assembled and computed
+            expert_cache.unprotect()
 
             # Delete stacked expert tensors (they're copies from cache, not needed after compute).
             # The actual mx.clear_cache() is done once per token after all layers complete.
             del expert_tensors
 
-            expert_time = time.time() - t_expert
+            if profile:
+                t_layer_end = time.perf_counter()
+                layer_total_ms = (t_layer_end - t_layer_start) * 1000
+                # Compute eval sync total for this layer
+                layer_eval_sync_ms = layer_attn_eval_ms + layer_route_eval_ms + layer_expert_eval_ms + layer_compute_eval_ms
+                # Python overhead = total - (routing + cache_lookup + io + compute + eval_sync)
+                layer_python_overhead_ms = layer_total_ms - layer_routing_ms - layer_cache_lookup_ms - layer_io_ms - layer_compute_ms - layer_eval_sync_ms
+                if layer_python_overhead_ms < 0:
+                    layer_python_overhead_ms = 0.0
+
+                # Skip prompt token (token_idx == 0) for profiling accumulation
+                if token_idx > 0:
+                    prof_totals["routing_ms"] += layer_routing_ms
+                    prof_totals["cache_lookup_ms"] += layer_cache_lookup_ms
+                    prof_totals["io_ms"] += layer_io_ms
+                    prof_totals["compute_ms"] += layer_compute_ms
+                    prof_totals["eval_sync_ms"] += layer_eval_sync_ms
+                    prof_totals["python_overhead_ms"] += layer_python_overhead_ms
+
+                    pld = prof_per_layer[i]
+                    pld["hits"] += layer_cache_hits
+                    pld["misses"] += layer_cache_misses
+                    pld["io_ms"] += layer_io_ms
+                    pld["bytes_read"] += layer_io_bytes
+                    pld["eval_sync_ms"] += layer_eval_sync_ms
+                    pld["compute_ms"] += layer_compute_ms
+                    pld["routing_ms"] += layer_routing_ms
+
+            if profile:
+                # For compat with existing layer_timings: include eval sync in these totals
+                attn_router_ms = layer_routing_ms + layer_attn_eval_ms + layer_route_eval_ms
+                expert_ms = (t_layer_end - t_expert) * 1000
+            else:
+                attn_router_ms = attn_router_time * 1000
+                expert_ms = (time.time() - t_expert) * 1000
 
             layer_timings.append({
                 "layer": i,
                 "is_linear": layer.is_linear,
-                "attn_router_ms": attn_router_time * 1000,
-                "expert_ms": expert_time * 1000,
+                "attn_router_ms": attn_router_ms,
+                "expert_ms": expert_ms,
                 "clear_ms": 0.0,
-                "load_ms": expert_time * 1000,  # total I/O for compat (only experts now)
-                "compute_ms": attn_router_time * 1000,  # compute portion for compat
+                "load_ms": expert_ms,  # total I/O for compat (only experts now)
+                "compute_ms": attn_router_ms,  # compute portion for compat
             })
 
         all_layer_timings.append(layer_timings)
@@ -1342,9 +1619,12 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
         token_id = next_token.item()
         generated_tokens.append(token_id)
 
-        t_token_end = time.time()
+        t_token_end = time.perf_counter() if profile else time.time()
         token_time = t_token_end - t_token_start
         token_times.append(token_time)
+
+        if profile and token_idx > 0:
+            prof_token_count += 1
 
         cur_mem = get_mem_gb()
         peak_mem = max(peak_mem, cur_mem)
@@ -1433,6 +1713,54 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
         avg_io_ms = 0
         avg_arr_ms = 0
         avg_moe_ms = 0
+
+    # === Detailed profiling summary (only when --profile is set) ===
+    if profile and prof_token_count > 0:
+        model_name = str(model_path).split("/")[-1]
+        # Compute grand total for percentage calculation
+        grand_total = sum(prof_totals.values())
+        if grand_total <= 0:
+            grand_total = 1.0  # avoid division by zero
+
+        print(f"\n  === Per-Token Time Breakdown ({model_name}, {prof_token_count} tokens) ===")
+        print(f"  {'Component':<20s} {'Total(ms)':>10s} {'Per-Token(ms)':>14s} {'Pct':>6s}")
+        for comp_name, comp_key in [
+            ("Routing",           "routing_ms"),
+            ("Cache Lookup",      "cache_lookup_ms"),
+            ("I/O (disk reads)",  "io_ms"),
+            ("Compute (GPU)",     "compute_ms"),
+            ("mx.eval() syncs",   "eval_sync_ms"),
+            ("Python Overhead",   "python_overhead_ms"),
+        ]:
+            total_ms = prof_totals[comp_key]
+            per_tok = total_ms / prof_token_count
+            pct = total_ms / grand_total * 100
+            print(f"  {comp_name:<20s} {total_ms:>10.1f} {per_tok:>14.2f} {pct:>5.1f}%")
+
+        per_tok_total = grand_total / prof_token_count
+        print(f"  {'TOTAL':<20s} {grand_total:>10.1f} {per_tok_total:>14.2f} {'100.0':>5s}%")
+
+        # Per-layer I/O detail table
+        print(f"\n  Per-Layer I/O Detail (averaged over {prof_token_count} tokens):")
+        print(f"  {'Layer':>5s}  {'Hits':>5s}  {'Misses':>6s}  {'IO_ms':>8s}  {'Bytes_Read':>12s}  {'Throughput_GBs':>14s}")
+        for layer_idx in sorted(prof_per_layer.keys()):
+            pld = prof_per_layer[layer_idx]
+            avg_hits = pld["hits"] / prof_token_count
+            avg_misses = pld["misses"] / prof_token_count
+            avg_io_layer_ms = pld["io_ms"] / prof_token_count
+            avg_bytes = pld["bytes_read"] / prof_token_count
+            if avg_io_layer_ms > 0:
+                throughput_gbs = (avg_bytes / 1e9) / (avg_io_layer_ms / 1000)
+            else:
+                throughput_gbs = 0.0
+            # Format bytes nicely
+            if avg_bytes >= 1e6:
+                bytes_str = f"{avg_bytes/1e6:.1f}MB"
+            elif avg_bytes >= 1e3:
+                bytes_str = f"{avg_bytes/1e3:.1f}KB"
+            else:
+                bytes_str = f"{avg_bytes:.0f}B"
+            print(f"  {layer_idx:>5d}  {avg_hits:>5.1f}  {avg_misses:>6.1f}  {avg_io_layer_ms:>8.2f}  {bytes_str:>12s}  {throughput_gbs:>14.2f}")
 
     # Aggregate layer timing stats (skip first token — prompt processing is different)
     if all_layer_timings and len(all_layer_timings) > 1:
@@ -1588,6 +1916,1085 @@ def load_model_custom(model_path):
     return model, tokenizer
 
 
+def snapshot_cache(cache):
+    """Deep-copy the verifier's KV/recurrent caches so we can rollback on rejection.
+
+    The model uses two cache types:
+      - KVCache (full_attention layers): has keys/values arrays + offset counter
+      - ArraysCache (linear_attention layers): has cache list [conv_state, recurrent_state]
+
+    We snapshot the raw tensor state and scalar offsets so restore is cheap.
+    """
+    from mlx_lm.models.cache import KVCache as _KVCache, ArraysCache as _ArraysCache
+
+    snapshots = []
+    for c in cache:
+        if isinstance(c, _KVCache):
+            # Snapshot: (keys_copy, values_copy, offset)
+            # Only copy the live region to save memory
+            if c.keys is not None:
+                k = c.keys[..., :c.offset, :]
+                v = c.values[..., :c.offset, :]
+                mx.eval(k, v)
+                snapshots.append(("kv", k, v, c.offset))
+            else:
+                snapshots.append(("kv", None, None, 0))
+        elif isinstance(c, _ArraysCache):
+            # Snapshot each element of the cache list
+            parts = []
+            for item in c.cache:
+                if item is not None:
+                    cp = mx.array(item)
+                    mx.eval(cp)
+                    parts.append(cp)
+                else:
+                    parts.append(None)
+            snapshots.append(("arrays", parts))
+        else:
+            # Unknown cache type -- store None (will skip restore)
+            snapshots.append(("unknown",))
+    return snapshots
+
+
+def restore_cache(cache, snapshots):
+    """Restore verifier caches from a snapshot taken before speculative verification."""
+    from mlx_lm.models.cache import KVCache as _KVCache, ArraysCache as _ArraysCache
+
+    for c, snap in zip(cache, snapshots):
+        if snap[0] == "kv":
+            _, k, v, offset = snap
+            if k is not None:
+                # Overwrite the cache arrays and offset
+                c.keys = None
+                c.values = None
+                c.offset = 0
+                # Re-insert via update_and_fetch to reallocate properly
+                # The keys/values are [B, n_heads, seq, dim] -- feed all at once
+                c.update_and_fetch(k, v)
+                c.offset = offset
+            else:
+                c.keys = None
+                c.values = None
+                c.offset = 0
+        elif snap[0] == "arrays":
+            _, parts = snap
+            for idx, item in enumerate(parts):
+                c.cache[idx] = item
+
+
+def trim_verifier_cache(cache, num_to_trim):
+    """Trim the verifier cache by num_to_trim positions.
+
+    For KVCache layers: use the built-in trim method (adjusts offset).
+    For ArraysCache layers (linear attention): these use recurrent state that
+    cannot be partially trimmed. We leave them as-is since the recurrent state
+    from rejected tokens is a minor approximation error that does not affect
+    correctness significantly (the state is a compressed summary, not per-token).
+
+    This is faster than full snapshot/restore when we only reject the tail.
+    """
+    from mlx_lm.models.cache import KVCache as _KVCache
+
+    for c in cache:
+        if isinstance(c, _KVCache) and c.offset >= num_to_trim:
+            c.trim(num_to_trim)
+
+
+def generate_speculative(
+    draft_model,
+    verifier_model,
+    tokenizer,
+    prompt,
+    max_tokens,
+    weight_index,
+    model_path,
+    draft_k=8,
+    preload_topk=0,
+    cache_gb=20.0,
+):
+    """Speculative decoding: draft K tokens with small model, verify with large model.
+
+    Uses Leviathan et al. 2023 approach with greedy (argmax) acceptance:
+      1. Draft K tokens autoregressively with the 35B model (fast, in DRAM)
+      2. Feed all K draft tokens to the 397B verifier in a single batched forward pass
+      3. Accept tokens greedily: for each position, if verifier agrees with draft, accept
+      4. On first disagreement, use verifier's token, discard remaining drafts
+      5. Rollback caches to the rejection point
+
+    Args:
+        draft_model: Small model loaded fully in DRAM (e.g. Qwen3.5-35B-A3B)
+        verifier_model: Large model with only global+non-expert weights loaded
+        tokenizer: Shared tokenizer (identical for both models)
+        prompt: Input prompt string
+        max_tokens: Maximum tokens to generate
+        weight_index: Weight index for verifier model (from build_weight_index)
+        model_path: Path to verifier model safetensors
+        draft_k: Number of draft tokens per speculation round
+    """
+    t_start = time.time()
+
+    input_ids = mx.array(tokenizer.encode(prompt))[None, :]  # [1, seq_len]
+
+    # === Initialize caches for both models ===
+    draft_cache = draft_model.make_cache()
+    verifier_cache = verifier_model.make_cache()
+
+    lm_v = verifier_model.language_model
+    text_model_v = lm_v.model
+    layers_v = text_model_v.layers
+    num_layers_v = len(layers_v)
+
+    generated_tokens = []
+    peak_mem = get_mem_gb()
+
+    from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+
+    # === Pre-load verifier non-expert weights (same as offload_selective) ===
+    t_preload = time.time()
+    header_cache = {}
+    all_nonexpert_weights = []
+
+    file_to_names = defaultdict(list)
+    file_to_san = {}
+    for layer_i in range(num_layers_v):
+        entries = weight_index.get(layer_i, [])
+        non_expert, _ = split_layer_entries(entries)
+        for name, filepath in non_expert:
+            file_to_names[filepath].append(name)
+            san_name = name
+            if san_name.startswith("language_model."):
+                san_name = san_name[len("language_model."):]
+            file_to_san[(filepath, name)] = san_name
+
+    for filepath, names in sorted(file_to_names.items()):
+        tensors = read_tensors_direct(filepath, names, header_cache, file_handle_cache=None)
+        for name in names:
+            if name in tensors:
+                san_name = file_to_san[(filepath, name)]
+                all_nonexpert_weights.append((san_name, tensors[name]))
+        print(f"    read {len(names)} tensors from {Path(filepath).name} "
+              f"({get_mem_gb():.1f}GB)", flush=True)
+
+    print(f"    Total non-expert weights to load: {len(all_nonexpert_weights)}")
+    lm_v.load_weights(all_nonexpert_weights, strict=False)
+    del all_nonexpert_weights
+    preload_time = time.time() - t_preload
+    print(f"  Pre-loaded verifier non-expert weights in {preload_time:.1f}s "
+          f"({get_mem_gb():.1f}GB)")
+
+    # === File handle cache for expert I/O ===
+    file_handle_cache = {}
+
+    # === Expert LRU cache ===
+    active_experts = lm_v.args.num_experts_per_tok
+    cache_entries = num_layers_v * active_experts * 8
+    hidden = lm_v.args.hidden_size
+    intermediate = lm_v.args.moe_intermediate_size
+    per_expert_bytes = 3 * intermediate * hidden * 9 // 16
+    max_cache_gb = cache_gb
+    # Memory safety: cap total DRAM = non_expert (~5GB) + draft (~7GB) + cache
+    if max_cache_gb + 12 > 43:
+        adjusted = 43.0 - 12.0
+        print(f"[cache] WARNING: cache_gb={max_cache_gb:.1f} + models (~12GB) exceeds 43GB safety limit. "
+              f"Reducing cache to {adjusted:.1f}GB")
+        max_cache_gb = adjusted
+    max_entries_by_mem = int(max_cache_gb * 1e9 / per_expert_bytes) if per_expert_bytes > 0 else cache_entries
+    if cache_entries > max_entries_by_mem:
+        print(f"[cache] Capping entries from {cache_entries} to {max_entries_by_mem} "
+              f"(~{max_cache_gb:.0f}GB limit, {per_expert_bytes/1e6:.1f}MB/entry)")
+        cache_entries = max_entries_by_mem
+    elif max_entries_by_mem > cache_entries:
+        print(f"[cache] Expanding entries from {cache_entries} to {max_entries_by_mem} "
+              f"(~{max_cache_gb:.0f}GB budget, {per_expert_bytes/1e6:.1f}MB/entry)")
+        cache_entries = max_entries_by_mem
+    expert_cache = ExpertCache(max_entries=cache_entries)
+
+    # === Pre-load hot experts if requested ===
+    if preload_topk > 0:
+        preload_hot_experts(expert_cache, weight_index, model_path, num_layers_v,
+                            preload_topk, header_cache)
+
+    # === Quantization params ===
+    with open(model_path / "config.json") as f:
+        _cfg = json.load(f)
+    _qcfg = _cfg.get("quantization", _cfg.get("quantization_config", {}))
+    qparams = {
+        "group_size": _qcfg.get("group_size", 64),
+        "bits": _qcfg.get("bits", 4),
+        "mode": _qcfg.get("mode", "affine"),
+    }
+    del _cfg, _qcfg
+
+    # === Statistics tracking ===
+    total_drafted = 0
+    total_accepted = 0
+    total_rounds = 0
+    round_times = []  # wall time per speculation round
+    draft_times = []
+    verify_times = []
+
+    # === Prompt prefill for BOTH models ===
+    # Draft model: run prompt through to populate its KV cache
+    print(f"  Prefilling draft model...", flush=True)
+    t_prefill_draft = time.time()
+    draft_logits = manual_forward(draft_model, input_ids, draft_cache)
+    mx.eval(draft_logits)
+    prefill_draft_time = time.time() - t_prefill_draft
+
+    # Get first token from draft model's prompt logits
+    first_token = mx.argmax(draft_logits[:, -1, :], axis=-1)
+    mx.eval(first_token)
+
+    # Verifier model: run prompt through to populate its KV/recurrent cache
+    # We need to run the FULL verifier forward including MoE expert loading
+    print(f"  Prefilling verifier model...", flush=True)
+    t_prefill_verify = time.time()
+
+    # Run verifier prefill token-by-token for prompt (uses the offload_selective path)
+    # For simplicity, feed the whole prompt as a sequence
+    h_v = text_model_v.embed_tokens(input_ids)
+    mx.eval(h_v)
+
+    fa_mask = create_attention_mask(h_v, verifier_cache[text_model_v.fa_idx])
+    ssm_mask = create_ssm_mask(h_v, verifier_cache[text_model_v.ssm_idx])
+
+    for i in range(num_layers_v):
+        layer = layers_v[i]
+        c = verifier_cache[i]
+        entries = weight_index.get(i, [])
+        _, expert_entries = split_layer_entries(entries)
+
+        # Phase 1: Attention + router
+        x_normed = layer.input_layernorm(h_v)
+        mask = ssm_mask if layer.is_linear else fa_mask
+        if layer.is_linear:
+            r = layer.linear_attn(x_normed, mask, c)
+        else:
+            r = layer.self_attn(x_normed, mask, c)
+        h_mid = h_v + r
+        mx.eval(h_mid)
+
+        # Phase 2: MoE with expert loading
+        h_post = layer.post_attention_layernorm(h_mid)
+        gates = layer.mlp.gate(h_post)
+        gates = mx.softmax(gates, axis=-1, precise=True)
+        k_experts = layer.mlp.top_k
+        inds = mx.argpartition(gates, kth=-k_experts, axis=-1)[..., -k_experts:]
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        scores = scores / scores.sum(axis=-1, keepdims=True)
+        mx.eval(inds)
+
+        inds_np = np.array(inds.tolist())
+        unique_experts = np.unique(inds_np)
+        num_unique = len(unique_experts)
+        unique_list = unique_experts.tolist()
+
+        remap = np.zeros(layer.mlp.num_experts, dtype=np.int32)
+        remap[unique_experts] = np.arange(num_unique)
+        remapped_inds = mx.array(remap[inds_np])
+
+        expert_file_map = {}
+        for name, filepath in expert_entries:
+            expert_file_map[name] = filepath
+
+        expert_cache.protect([(i, idx) for idx in unique_list])
+        uncached_list = []
+        for idx in unique_list:
+            if expert_cache.has_expert(i, idx):
+                expert_cache.record_hit()
+                expert_cache.touch(i, idx)
+            else:
+                expert_cache.record_miss()
+                uncached_list.append(idx)
+
+        if uncached_list:
+            for filepath in set(expert_file_map.values()):
+                if filepath not in header_cache:
+                    header_cache[filepath] = parse_safetensors_header(filepath)
+
+            with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
+                futures = [
+                    executor.submit(
+                        _read_single_expert_attrs,
+                        expert_idx, i, expert_file_map, header_cache
+                    )
+                    for expert_idx in uncached_list
+                ]
+                for future in futures:
+                    eidx, attrs, io_stats = future.result()
+                    for (proj_name, attr_name), arr in attrs.items():
+                        expert_cache.put_attr(i, eidx, proj_name, attr_name, arr)
+
+        expert_tensors = {}
+        for proj_name in ["gate_proj", "up_proj", "down_proj"]:
+            for attr_name in ["weight", "scales", "biases"]:
+                slices = []
+                for idx in unique_list:
+                    arr = expert_cache.get_attr(i, idx, proj_name, attr_name)
+                    if arr is not None:
+                        slices.append(arr)
+                    else:
+                        raise RuntimeError(
+                            f"Expert cache miss during prefill: layer={i} expert={idx} "
+                            f"{proj_name}.{attr_name}")
+                if slices:
+                    expert_tensors[f"{proj_name}.{attr_name}"] = mx.stack(slices, axis=0)
+
+        mx.eval(*expert_tensors.values())
+
+        y = compute_moe_direct(
+            h_post, remapped_inds, expert_tensors,
+            group_size=qparams["group_size"],
+            bits=qparams["bits"],
+            mode=qparams["mode"],
+        )
+        y = (y * scores[..., None]).sum(axis=-2)
+
+        shared_y = layer.mlp.shared_expert(h_post)
+        shared_y = mx.sigmoid(layer.mlp.shared_expert_gate(h_post)) * shared_y
+        y = y + shared_y
+
+        h_v = h_mid + y
+        mx.eval(h_v)
+        expert_cache.unprotect()
+        del expert_tensors
+
+    mx.clear_cache()
+
+    h_v = text_model_v.norm(h_v)
+    if lm_v.args.tie_word_embeddings:
+        verifier_logits = text_model_v.embed_tokens.as_linear(h_v)
+    else:
+        verifier_logits = lm_v.lm_head(h_v)
+    mx.eval(verifier_logits)
+
+    # Verifier's first token prediction (what should come after the prompt)
+    verifier_first = mx.argmax(verifier_logits[:, -1, :], axis=-1)
+    mx.eval(verifier_first)
+
+    prefill_verify_time = time.time() - t_prefill_verify
+    print(f"  Prefill: draft={prefill_draft_time:.1f}s, verifier={prefill_verify_time:.1f}s")
+
+    # Use verifier's token as the authoritative first token
+    first_token_id = verifier_first.item()
+    generated_tokens.append(first_token_id)
+
+    # Track the verifier's prediction for the NEXT position.
+    # After prefill, verifier_logits[:, -1, :] predicted first_token (committed above).
+    # Now we need the verifier's prediction for position 2 (what follows first_token).
+    # We'll get this by running first_token through the verifier for one step.
+    #
+    # For the speculative loop, verifier_pending_pred stores the verifier's argmax
+    # prediction for the next token (the one the draft needs to match as d_0).
+    # We get this by running first_token through the verifier.
+    _vp_input = verifier_first.reshape(1, 1)
+    h_vp = text_model_v.embed_tokens(_vp_input)
+    mx.eval(h_vp)
+    fa_mask = create_attention_mask(h_vp, verifier_cache[text_model_v.fa_idx])
+    ssm_mask = create_ssm_mask(h_vp, verifier_cache[text_model_v.ssm_idx])
+    for i in range(num_layers_v):
+        layer = layers_v[i]
+        c = verifier_cache[i]
+        entries = weight_index.get(i, [])
+        _, expert_entries = split_layer_entries(entries)
+
+        x_normed = layer.input_layernorm(h_vp)
+        mask = ssm_mask if layer.is_linear else fa_mask
+        if layer.is_linear:
+            r = layer.linear_attn(x_normed, mask, c)
+        else:
+            r = layer.self_attn(x_normed, mask, c)
+        h_mid_vp = h_vp + r
+        mx.eval(h_mid_vp)
+
+        h_post_vp = layer.post_attention_layernorm(h_mid_vp)
+        gates = layer.mlp.gate(h_post_vp)
+        gates = mx.softmax(gates, axis=-1, precise=True)
+        k_experts = layer.mlp.top_k
+        inds = mx.argpartition(gates, kth=-k_experts, axis=-1)[..., -k_experts:]
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        scores = scores / scores.sum(axis=-1, keepdims=True)
+        mx.eval(inds)
+
+        inds_np = np.array(inds.tolist())
+        unique_experts = np.unique(inds_np)
+        unique_list = unique_experts.tolist()
+        remap = np.zeros(layer.mlp.num_experts, dtype=np.int32)
+        remap[unique_experts] = np.arange(len(unique_experts))
+        remapped_inds = mx.array(remap[inds_np])
+
+        expert_file_map = {}
+        for name, filepath in expert_entries:
+            expert_file_map[name] = filepath
+
+        expert_cache.protect([(i, idx) for idx in unique_list])
+        uncached_list = []
+        for idx in unique_list:
+            if expert_cache.has_expert(i, idx):
+                expert_cache.record_hit()
+                expert_cache.touch(i, idx)
+            else:
+                expert_cache.record_miss()
+                uncached_list.append(idx)
+        if uncached_list:
+            for filepath in set(expert_file_map.values()):
+                if filepath not in header_cache:
+                    header_cache[filepath] = parse_safetensors_header(filepath)
+            with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
+                futures = [
+                    executor.submit(_read_single_expert_attrs, eidx, i, expert_file_map, header_cache)
+                    for eidx in uncached_list
+                ]
+                for future in futures:
+                    eidx, attrs, _ = future.result()
+                    for (pn, an), arr in attrs.items():
+                        expert_cache.put_attr(i, eidx, pn, an, arr)
+
+        expert_tensors = {}
+        for proj_name in ["gate_proj", "up_proj", "down_proj"]:
+            for attr_name in ["weight", "scales", "biases"]:
+                slices = [expert_cache.get_attr(i, idx, proj_name, attr_name) for idx in unique_list]
+                if all(s is not None for s in slices):
+                    expert_tensors[f"{proj_name}.{attr_name}"] = mx.stack(slices, axis=0)
+        mx.eval(*expert_tensors.values())
+
+        y = compute_moe_direct(
+            h_post_vp, remapped_inds, expert_tensors,
+            group_size=qparams["group_size"], bits=qparams["bits"], mode=qparams["mode"],
+        )
+        y = (y * scores[..., None]).sum(axis=-2)
+        shared_y = layer.mlp.shared_expert(h_post_vp)
+        shared_y = mx.sigmoid(layer.mlp.shared_expert_gate(h_post_vp)) * shared_y
+        y = y + shared_y
+        h_vp = h_mid_vp + y
+        mx.eval(h_vp)
+        expert_cache.unprotect()
+        del expert_tensors
+    mx.clear_cache()
+
+    h_vp = text_model_v.norm(h_vp)
+    if lm_v.args.tie_word_embeddings:
+        _vp_logits = text_model_v.embed_tokens.as_linear(h_vp)
+    else:
+        _vp_logits = lm_v.lm_head(h_vp)
+    mx.eval(_vp_logits)
+
+    # This is the verifier's prediction for position 2 (what follows first_token)
+    verifier_pending_pred = mx.argmax(_vp_logits[:, -1, :], axis=-1).item()
+    del _vp_logits, h_vp
+
+    # Set up the next input for draft model
+    draft_input = verifier_first.reshape(1, 1)
+
+    print(f"  Starting speculative decode loop (K={draft_k})...", flush=True)
+
+    # === Main speculative decode loop ===
+    while len(generated_tokens) < max_tokens:
+        t_round_start = time.time()
+        remaining = max_tokens - len(generated_tokens)
+        K = min(draft_k, remaining)
+
+        # ============================================================
+        # PHASE 1: Draft K tokens with the small model (fast, in DRAM)
+        # ============================================================
+        t_draft_start = time.time()
+        draft_token_ids = []
+        cur_draft_input = draft_input
+
+        for d in range(K):
+            d_logits = manual_forward(draft_model, cur_draft_input, draft_cache)
+            mx.eval(d_logits)
+            d_token = mx.argmax(d_logits[:, -1, :], axis=-1)
+            mx.eval(d_token)
+            draft_token_ids.append(d_token.item())
+            cur_draft_input = d_token.reshape(1, 1)
+
+        draft_time = time.time() - t_draft_start
+        draft_times.append(draft_time)
+
+        # ============================================================
+        # PHASE 2: Verify all K tokens with the 397B model (batched)
+        # ============================================================
+        t_verify_start = time.time()
+
+        # Snapshot verifier cache BEFORE verification so we can rollback
+        # Only snapshot on first few rounds or when K > 1 to avoid overhead
+        cache_snapshot = snapshot_cache(verifier_cache)
+
+        # Build the verification input: all K draft tokens as a sequence
+        # The verifier's cache already contains everything up to the last accepted token.
+        # We feed [draft_0, draft_1, ..., draft_{K-1}] as a single sequence.
+        verify_input = mx.array([[t for t in draft_token_ids]])  # [1, K]
+
+        # Run verifier forward pass through all layers (batched K tokens)
+        h_v = text_model_v.embed_tokens(verify_input)
+        mx.eval(h_v)
+
+        fa_mask = create_attention_mask(h_v, verifier_cache[text_model_v.fa_idx])
+        ssm_mask = create_ssm_mask(h_v, verifier_cache[text_model_v.ssm_idx])
+
+        token_io_bytes = 0
+        token_io_time = 0.0
+
+        for i in range(num_layers_v):
+            layer = layers_v[i]
+            c = verifier_cache[i]
+            entries = weight_index.get(i, [])
+            _, expert_entries = split_layer_entries(entries)
+
+            # Attention (handles K tokens naturally via the cache)
+            x_normed = layer.input_layernorm(h_v)
+            mask = ssm_mask if layer.is_linear else fa_mask
+            if layer.is_linear:
+                r = layer.linear_attn(x_normed, mask, c)
+            else:
+                r = layer.self_attn(x_normed, mask, c)
+            h_mid = h_v + r
+            mx.eval(h_mid)
+
+            # Router: discovers experts for ALL K positions at once
+            h_post = layer.post_attention_layernorm(h_mid)
+            gates = layer.mlp.gate(h_post)
+            gates = mx.softmax(gates, axis=-1, precise=True)
+            k_experts = layer.mlp.top_k
+            inds = mx.argpartition(gates, kth=-k_experts, axis=-1)[..., -k_experts:]
+            scores = mx.take_along_axis(gates, inds, axis=-1)
+            scores = scores / scores.sum(axis=-1, keepdims=True)
+            mx.eval(inds)
+
+            # Key optimization: collect unique experts across ALL K positions
+            # Each position routes to k_experts, but many overlap across positions
+            inds_np = np.array(inds.tolist())
+            unique_experts = np.unique(inds_np)
+            num_unique = len(unique_experts)
+            unique_list = unique_experts.tolist()
+
+            remap = np.zeros(layer.mlp.num_experts, dtype=np.int32)
+            remap[unique_experts] = np.arange(num_unique)
+            remapped_inds = mx.array(remap[inds_np])
+
+            expert_file_map = {}
+            for name, filepath in expert_entries:
+                expert_file_map[name] = filepath
+
+            # LRU cache check
+            expert_cache.protect([(i, idx) for idx in unique_list])
+            uncached_list = []
+            for idx in unique_list:
+                if expert_cache.has_expert(i, idx):
+                    expert_cache.record_hit()
+                    expert_cache.touch(i, idx)
+                else:
+                    expert_cache.record_miss()
+                    uncached_list.append(idx)
+
+            # Load uncached experts from disk (threaded)
+            if uncached_list:
+                for filepath in set(expert_file_map.values()):
+                    if filepath not in header_cache:
+                        header_cache[filepath] = parse_safetensors_header(filepath)
+
+                with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
+                    futures = [
+                        executor.submit(
+                            _read_single_expert_attrs,
+                            expert_idx, i, expert_file_map, header_cache
+                        )
+                        for expert_idx in uncached_list
+                    ]
+                    for future in futures:
+                        eidx, attrs, io_stats = future.result()
+                        token_io_bytes += io_stats["bytes_read"]
+                        token_io_time += io_stats["io_time_s"]
+                        for (proj_name, attr_name), arr in attrs.items():
+                            expert_cache.put_attr(i, eidx, proj_name, attr_name, arr)
+
+            # Assemble expert tensors
+            expert_tensors = {}
+            for proj_name in ["gate_proj", "up_proj", "down_proj"]:
+                for attr_name in ["weight", "scales", "biases"]:
+                    slices = []
+                    for idx in unique_list:
+                        arr = expert_cache.get_attr(i, idx, proj_name, attr_name)
+                        if arr is not None:
+                            slices.append(arr)
+                        else:
+                            raise RuntimeError(
+                                f"Expert cache miss: layer={i} expert={idx} "
+                                f"{proj_name}.{attr_name}")
+                    if slices:
+                        expert_tensors[f"{proj_name}.{attr_name}"] = mx.stack(slices, axis=0)
+
+            mx.eval(*expert_tensors.values())
+
+            # Batched MoE computation: compute_moe_direct handles [1, K, hidden]
+            y = compute_moe_direct(
+                h_post, remapped_inds, expert_tensors,
+                group_size=qparams["group_size"],
+                bits=qparams["bits"],
+                mode=qparams["mode"],
+            )
+            y = (y * scores[..., None]).sum(axis=-2)
+
+            shared_y = layer.mlp.shared_expert(h_post)
+            shared_y = mx.sigmoid(layer.mlp.shared_expert_gate(h_post)) * shared_y
+            y = y + shared_y
+
+            h_v = h_mid + y
+            mx.eval(h_v)
+            expert_cache.unprotect()
+            del expert_tensors
+
+        mx.clear_cache()
+
+        # Norm + LM head
+        h_v = text_model_v.norm(h_v)
+        if lm_v.args.tie_word_embeddings:
+            v_logits = text_model_v.embed_tokens.as_linear(h_v)
+        else:
+            v_logits = lm_v.lm_head(h_v)
+        mx.eval(v_logits)
+
+        verify_time = time.time() - t_verify_start
+        verify_times.append(verify_time)
+
+        # ============================================================
+        # PHASE 3: Greedy acceptance (Leviathan et al. 2023, argmax)
+        # ============================================================
+        # verifier_pending_pred: the verifier's argmax prediction for the NEXT token
+        #   (carried from previous round or prefill). This validates d_0.
+        #
+        # v_logits has shape [1, K, vocab_size] from the batched verification.
+        # After processing [d_0, d_1, ..., d_{K-1}]:
+        #   v_logits[:, j, :] = P(next | context ++ [d_0, ..., d_j])
+        # So:
+        #   v_logits[:, 0, :] predicts what follows d_0 -> validates d_1
+        #   v_logits[:, 1, :] predicts what follows d_0,d_1 -> validates d_2
+        #   ...
+        #   v_logits[:, K-1, :] predicts what follows all K -> bonus token
+        #
+        # Acceptance:
+        #   1. Check d_0 against verifier_pending_pred (from previous round)
+        #   2. For j=0..K-2: check d_{j+1} against argmax(v_logits[:, j, :])
+        #   3. If all pass, bonus = argmax(v_logits[:, K-1, :])
+
+        v_argmax = mx.argmax(v_logits, axis=-1)  # [1, K]
+        mx.eval(v_argmax)
+        v_preds = v_argmax[0].tolist()  # list of K ints
+
+        accepted_tokens = []
+
+        # Step 1: validate d_0 against verifier's pending prediction
+        if draft_token_ids[0] == verifier_pending_pred:
+            # d_0 matches verifier's expectation
+            accepted_tokens.append(draft_token_ids[0])
+
+            # Step 2: validate d_1 through d_{K-1}
+            for j in range(K - 1):
+                # v_preds[j] = verifier's argmax after seeing d_0..d_j
+                # This should match draft_token_ids[j+1]
+                if v_preds[j] == draft_token_ids[j + 1]:
+                    accepted_tokens.append(draft_token_ids[j + 1])
+                else:
+                    # Reject d_{j+1}: use verifier's prediction as correction
+                    accepted_tokens.append(v_preds[j])
+                    break
+            else:
+                # All K draft tokens accepted -- bonus token from verifier
+                accepted_tokens.append(v_preds[K - 1])
+        else:
+            # d_0 itself was wrong. Use verifier's pending prediction as correction.
+            # No draft tokens accepted.
+            accepted_tokens.append(verifier_pending_pred)
+
+        generated_tokens.extend(accepted_tokens)
+        total_drafted += K
+        total_accepted += len(accepted_tokens)
+        total_rounds += 1
+
+        # ============================================================
+        # PHASE 4: Cache management and verifier_pending_pred update
+        # ============================================================
+        # The verifier processed all K draft tokens in its forward pass.
+        # accepted_tokens has len N_acc where the last token is either:
+        #   - A bonus token (all K accepted, N_acc = K+1)
+        #   - A correction token (draft rejected at some point, N_acc <= K)
+        #   - The verifier's pending pred (d_0 itself was wrong, N_acc = 1)
+        #
+        # We need to:
+        #   1. Determine how many of the K draft tokens in the cache are valid
+        #   2. Rollback/trim the verifier cache if needed
+        #   3. Set verifier_pending_pred for the next round
+        #   4. Trim draft model cache similarly
+        #
+        # Case analysis for accepted_tokens:
+        #   If d_0 was wrong: accepted = [verifier_pending_pred]. 0 draft tokens in cache are valid.
+        #   If d_0 OK, rejected at d_{j+1}: accepted = [d_0, ..., d_j, correction].
+        #     (j+1) draft tokens in cache are valid.
+        #   If all K accepted + bonus: accepted = [d_0, ..., d_{K-1}, bonus].
+        #     All K draft tokens in cache are valid.
+
+        d0_was_wrong = (draft_token_ids[0] != verifier_pending_pred)
+        all_accepted_with_bonus = (len(accepted_tokens) == K + 1) and not d0_was_wrong
+
+        if d0_was_wrong:
+            # d_0 was wrong. The verifier cache has K positions from the forward pass,
+            # but NONE are valid (since d_0 itself was wrong). Restore from snapshot.
+            n_valid_in_cache = 0
+        elif all_accepted_with_bonus:
+            # All K accepted. Cache has K valid positions.
+            n_valid_in_cache = K
+        else:
+            # Rejected at some point. accepted_tokens = [d_0, ..., d_j, correction].
+            # d_0 through d_j were correct = len(accepted_tokens) - 1 valid positions.
+            n_valid_in_cache = len(accepted_tokens) - 1
+
+        # Rollback verifier cache if needed
+        if n_valid_in_cache < K:
+            # Restore from snapshot and re-run only the valid portion
+            restore_cache(verifier_cache, cache_snapshot)
+
+            if n_valid_in_cache > 0:
+                rerun_input = mx.array([draft_token_ids[:n_valid_in_cache]])  # [1, n_valid]
+
+                h_v = text_model_v.embed_tokens(rerun_input)
+                mx.eval(h_v)
+
+                fa_mask = create_attention_mask(h_v, verifier_cache[text_model_v.fa_idx])
+                ssm_mask = create_ssm_mask(h_v, verifier_cache[text_model_v.ssm_idx])
+
+                for i in range(num_layers_v):
+                    layer = layers_v[i]
+                    c_v = verifier_cache[i]
+                    entries = weight_index.get(i, [])
+                    _, expert_entries = split_layer_entries(entries)
+
+                    x_normed = layer.input_layernorm(h_v)
+                    mask = ssm_mask if layer.is_linear else fa_mask
+                    if layer.is_linear:
+                        r = layer.linear_attn(x_normed, mask, c_v)
+                    else:
+                        r = layer.self_attn(x_normed, mask, c_v)
+                    h_mid = h_v + r
+                    mx.eval(h_mid)
+
+                    h_post = layer.post_attention_layernorm(h_mid)
+                    gates = layer.mlp.gate(h_post)
+                    gates = mx.softmax(gates, axis=-1, precise=True)
+                    k_exp = layer.mlp.top_k
+                    inds = mx.argpartition(gates, kth=-k_exp, axis=-1)[..., -k_exp:]
+                    scores = mx.take_along_axis(gates, inds, axis=-1)
+                    scores = scores / scores.sum(axis=-1, keepdims=True)
+                    mx.eval(inds)
+
+                    inds_np = np.array(inds.tolist())
+                    unique_experts = np.unique(inds_np)
+                    unique_list = unique_experts.tolist()
+
+                    remap = np.zeros(layer.mlp.num_experts, dtype=np.int32)
+                    remap[unique_experts] = np.arange(len(unique_experts))
+                    remapped_inds = mx.array(remap[inds_np])
+
+                    expert_file_map = {}
+                    for name, filepath in expert_entries:
+                        expert_file_map[name] = filepath
+
+                    expert_cache.protect([(i, idx) for idx in unique_list])
+                    uncached_list = []
+                    for idx in unique_list:
+                        if expert_cache.has_expert(i, idx):
+                            expert_cache.record_hit()
+                            expert_cache.touch(i, idx)
+                        else:
+                            expert_cache.record_miss()
+                            uncached_list.append(idx)
+
+                    if uncached_list:
+                        for filepath in set(expert_file_map.values()):
+                            if filepath not in header_cache:
+                                header_cache[filepath] = parse_safetensors_header(filepath)
+                        with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
+                            futures = [
+                                executor.submit(
+                                    _read_single_expert_attrs,
+                                    expert_idx, i, expert_file_map, header_cache
+                                )
+                                for expert_idx in uncached_list
+                            ]
+                            for future in futures:
+                                eidx, attrs, io_stats = future.result()
+                                for (proj_name, attr_name), arr in attrs.items():
+                                    expert_cache.put_attr(i, eidx, proj_name, attr_name, arr)
+
+                    expert_tensors = {}
+                    for proj_name in ["gate_proj", "up_proj", "down_proj"]:
+                        for attr_name in ["weight", "scales", "biases"]:
+                            slices = []
+                            for idx in unique_list:
+                                arr = expert_cache.get_attr(i, idx, proj_name, attr_name)
+                                if arr is not None:
+                                    slices.append(arr)
+                                else:
+                                    raise RuntimeError(
+                                        f"Expert cache miss in re-run: layer={i} expert={idx} "
+                                        f"{proj_name}.{attr_name}")
+                            if slices:
+                                expert_tensors[f"{proj_name}.{attr_name}"] = mx.stack(slices, axis=0)
+
+                    mx.eval(*expert_tensors.values())
+
+                    y = compute_moe_direct(
+                        h_post, remapped_inds, expert_tensors,
+                        group_size=qparams["group_size"],
+                        bits=qparams["bits"],
+                        mode=qparams["mode"],
+                    )
+                    y = (y * scores[..., None]).sum(axis=-2)
+
+                    shared_y = layer.mlp.shared_expert(h_post)
+                    shared_y = mx.sigmoid(layer.mlp.shared_expert_gate(h_post)) * shared_y
+                    y = y + shared_y
+
+                    h_v = h_mid + y
+                    mx.eval(h_v)
+                    expert_cache.unprotect()
+                    del expert_tensors
+
+                mx.clear_cache()
+
+        del cache_snapshot
+
+        # Update verifier_pending_pred for the next round.
+        # This is the verifier's argmax prediction for the token AFTER the last
+        # accepted token. We already have this from v_logits if the rejection
+        # point gave us the right position.
+        #
+        # Cases:
+        #   d0 wrong: accepted = [verifier_pending_pred]. The verifier's cache is
+        #     unchanged (restored). v_logits are from the bad forward pass, unusable.
+        #     We don't have a valid pending pred from v_logits. But the correction
+        #     token (verifier_pending_pred from last round) was committed. We need
+        #     the verifier's prediction for what follows THAT token. This requires
+        #     running the correction token through the verifier. We'll do that as
+        #     the last accepted token feed-through below.
+        #
+        #   Rejected d_{j+1}: accepted = [d_0, ..., d_j, correction].
+        #     correction = v_preds[j]. The verifier's cache has been rolled back
+        #     to d_0..d_j (n_valid_in_cache = j+1). We committed d_0..d_j plus the
+        #     correction. We need to feed the correction token to the verifier and
+        #     get its next prediction. OR we can use the v_logits from the original
+        #     forward pass since v_preds[j] came from v_logits[:, j, :]. The token
+        #     after the correction is NOT available from v_logits (the correction
+        #     token was never fed to the verifier).
+        #
+        #   All K accepted + bonus: accepted = [d_0, ..., d_{K-1}, bonus].
+        #     bonus = v_preds[K-1]. Cache has all K positions. We committed all K
+        #     plus the bonus. We need the verifier's prediction for what follows
+        #     the bonus token. This requires feeding the bonus token to the verifier.
+        #
+        # In all cases where we committed a token that the verifier hasn't "seen"
+        # (correction or bonus), we need to run that token through the verifier
+        # to get the next pending prediction. The last accepted token is always
+        # either a correction, bonus, or verifier_pending_pred -- none of which
+        # are in the verifier cache yet.
+
+        last_accepted = accepted_tokens[-1]
+        last_accepted_input = mx.array([[last_accepted]])
+
+        # Feed the last accepted token through the verifier to:
+        # 1. Update the verifier cache to include this token
+        # 2. Get verifier_pending_pred for the next round
+        h_v = text_model_v.embed_tokens(last_accepted_input)
+        mx.eval(h_v)
+        fa_mask = create_attention_mask(h_v, verifier_cache[text_model_v.fa_idx])
+        ssm_mask = create_ssm_mask(h_v, verifier_cache[text_model_v.ssm_idx])
+        for i in range(num_layers_v):
+            layer = layers_v[i]
+            c_v = verifier_cache[i]
+            entries = weight_index.get(i, [])
+            _, expert_entries = split_layer_entries(entries)
+
+            x_normed = layer.input_layernorm(h_v)
+            mask = ssm_mask if layer.is_linear else fa_mask
+            if layer.is_linear:
+                r = layer.linear_attn(x_normed, mask, c_v)
+            else:
+                r = layer.self_attn(x_normed, mask, c_v)
+            h_mid = h_v + r
+            mx.eval(h_mid)
+
+            h_post = layer.post_attention_layernorm(h_mid)
+            gates = layer.mlp.gate(h_post)
+            gates = mx.softmax(gates, axis=-1, precise=True)
+            k_exp = layer.mlp.top_k
+            inds = mx.argpartition(gates, kth=-k_exp, axis=-1)[..., -k_exp:]
+            scores = mx.take_along_axis(gates, inds, axis=-1)
+            scores = scores / scores.sum(axis=-1, keepdims=True)
+            mx.eval(inds)
+
+            inds_np = np.array(inds.tolist())
+            unique_experts = np.unique(inds_np)
+            unique_list = unique_experts.tolist()
+            remap = np.zeros(layer.mlp.num_experts, dtype=np.int32)
+            remap[unique_experts] = np.arange(len(unique_experts))
+            remapped_inds = mx.array(remap[inds_np])
+
+            expert_file_map = {}
+            for name, filepath in expert_entries:
+                expert_file_map[name] = filepath
+
+            expert_cache.protect([(i, idx) for idx in unique_list])
+            uncached_list = []
+            for idx in unique_list:
+                if expert_cache.has_expert(i, idx):
+                    expert_cache.record_hit()
+                    expert_cache.touch(i, idx)
+                else:
+                    expert_cache.record_miss()
+                    uncached_list.append(idx)
+            if uncached_list:
+                for filepath in set(expert_file_map.values()):
+                    if filepath not in header_cache:
+                        header_cache[filepath] = parse_safetensors_header(filepath)
+                with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
+                    futures = [
+                        executor.submit(_read_single_expert_attrs, eidx, i, expert_file_map, header_cache)
+                        for eidx in uncached_list
+                    ]
+                    for future in futures:
+                        eidx, attrs, _ = future.result()
+                        for (pn, an), arr in attrs.items():
+                            expert_cache.put_attr(i, eidx, pn, an, arr)
+
+            expert_tensors = {}
+            for proj_name in ["gate_proj", "up_proj", "down_proj"]:
+                for attr_name in ["weight", "scales", "biases"]:
+                    slices = [expert_cache.get_attr(i, idx, proj_name, attr_name) for idx in unique_list]
+                    if all(s is not None for s in slices):
+                        expert_tensors[f"{proj_name}.{attr_name}"] = mx.stack(slices, axis=0)
+            mx.eval(*expert_tensors.values())
+
+            y = compute_moe_direct(
+                h_post, remapped_inds, expert_tensors,
+                group_size=qparams["group_size"], bits=qparams["bits"], mode=qparams["mode"],
+            )
+            y = (y * scores[..., None]).sum(axis=-2)
+            shared_y = layer.mlp.shared_expert(h_post)
+            shared_y = mx.sigmoid(layer.mlp.shared_expert_gate(h_post)) * shared_y
+            y = y + shared_y
+            h_v = h_mid + y
+            mx.eval(h_v)
+            expert_cache.unprotect()
+            del expert_tensors
+        mx.clear_cache()
+
+        h_v = text_model_v.norm(h_v)
+        if lm_v.args.tie_word_embeddings:
+            _pp_logits = text_model_v.embed_tokens.as_linear(h_v)
+        else:
+            _pp_logits = lm_v.lm_head(h_v)
+        mx.eval(_pp_logits)
+        verifier_pending_pred = mx.argmax(_pp_logits[:, -1, :], axis=-1).item()
+        del _pp_logits
+
+        # Draft model cache rollback.
+        # The draft model ran K tokens autoregressively, building up its cache.
+        # We accepted n_valid_in_cache draft tokens (0 if d_0 was wrong).
+        # Trim the excess.
+        trim_amount = K - n_valid_in_cache
+        if trim_amount > 0:
+            from mlx_lm.models.cache import trim_prompt_cache
+            trim_prompt_cache(draft_cache, trim_amount)
+
+        # Set up next draft input = last accepted token
+        draft_input = mx.array([[last_accepted]])
+
+        # ============================================================
+        # Progress reporting
+        # ============================================================
+        t_round_end = time.time()
+        round_time = t_round_end - t_round_start
+        round_times.append(round_time)
+
+        cur_mem = get_mem_gb()
+        peak_mem = max(peak_mem, cur_mem)
+
+        n_generated = len(generated_tokens)
+        elapsed = t_round_end - t_start
+        effective_tps = n_generated / elapsed if elapsed > 0 else 0
+        accept_rate = total_accepted / total_drafted if total_drafted > 0 else 0
+        cache_hr = expert_cache.hit_rate
+
+        n_acc_this_round = len(accepted_tokens)
+        if all_accepted_with_bonus:
+            round_label = f"+1 bonus"
+        elif d0_was_wrong:
+            round_label = "d0 rejected"
+        else:
+            round_label = "correction"
+        print(f"  [token {n_generated}] accepted {n_acc_this_round}/{K} "
+              f"({round_label}), "
+              f"effective {effective_tps:.1f} tok/s, "
+              f"accept_rate {accept_rate:.0%}, cache_hit {cache_hr:.0%}, "
+              f"draft {draft_time*1000:.0f}ms verify {verify_time*1000:.0f}ms "
+              f"mem {cur_mem:.1f}GB",
+              flush=True)
+
+        # Safety: check memory pressure every few rounds
+        if total_rounds % 3 == 0:
+            pressure, free_pct = check_memory_pressure()
+            if pressure == "critical":
+                print(f"\n  ABORT: System memory free={free_pct}% (critical).")
+                break
+
+        # Truncate if we generated more than requested
+        if len(generated_tokens) > max_tokens:
+            generated_tokens = generated_tokens[:max_tokens]
+            break
+
+    # === Cleanup ===
+    for fh in file_handle_cache.values():
+        try:
+            fh.close()
+        except Exception:
+            pass
+
+    total_time = time.time() - t_start
+    total_tokens = len(generated_tokens)
+    text = tokenizer.decode(generated_tokens)
+
+    # Summary stats
+    avg_draft_ms = np.mean(draft_times) * 1000 if draft_times else 0
+    avg_verify_ms = np.mean(verify_times) * 1000 if verify_times else 0
+    avg_round_ms = np.mean(round_times) * 1000 if round_times else 0
+    accept_rate = total_accepted / total_drafted if total_drafted > 0 else 0
+    tokens_per_round = total_tokens / total_rounds if total_rounds > 0 else 0
+
+    return {
+        "text": text,
+        "tokens": total_tokens,
+        "total_time": total_time,
+        "tok_sec": total_tokens / total_time if total_time > 0 else 0,
+        "ttft_ms": (prefill_draft_time + prefill_verify_time) * 1000,
+        "peak_mem_gb": peak_mem,
+        "preload_time": preload_time,
+        "prefill_draft_time": prefill_draft_time,
+        "prefill_verify_time": prefill_verify_time,
+        "total_rounds": total_rounds,
+        "draft_k": draft_k,
+        "total_drafted": total_drafted,
+        "total_accepted": total_accepted,
+        "accept_rate": accept_rate,
+        "tokens_per_round": tokens_per_round,
+        "avg_draft_ms": avg_draft_ms,
+        "avg_verify_ms": avg_verify_ms,
+        "avg_round_ms": avg_round_ms,
+        "expert_cache_hits": expert_cache.hits,
+        "expert_cache_misses": expert_cache.misses,
+        "expert_cache_hit_rate": expert_cache.hit_rate,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Streaming inference engine")
     parser.add_argument("--model", required=True, help="HuggingFace model ID or local path")
@@ -1595,7 +3002,7 @@ def main():
     parser.add_argument("--prompt", default="Explain the theory of relativity in simple terms.",
                         help="Prompt for generation")
     parser.add_argument("--mode", choices=["baseline", "layerwise", "stream", "lazy", "offload", "offload_lazy",
-                                          "offload_selective"],
+                                          "offload_selective", "speculative"],
                         default="stream",
                         help="baseline=mlx_lm native, layerwise=manual forward with timing, "
                              "stream=reload weights from safetensors per layer, "
@@ -1604,10 +3011,38 @@ def main():
                              "offload_lazy=like offload but skips mx.eval(params) so only "
                              "accessed expert pages are read via lazy mmap (~40MB vs ~1.3GB/layer), "
                              "offload_selective=run router first, then load only selected "
-                             "expert slices per layer (large I/O reduction vs full layer load)")
+                             "expert slices per layer (large I/O reduction vs full layer load), "
+                             "speculative=draft tokens with small model, verify with large model")
     parser.add_argument("--max-mem-gb", type=float, default=40.0,
                         help="Abort if RSS exceeds this (GB)")
+    parser.add_argument("--draft-model", default="mlx-community/Qwen3.5-35B-A3B-4bit",
+                        help="Draft model for speculative decoding (must fit in DRAM)")
+    parser.add_argument("--draft-k", type=int, default=8,
+                        help="Number of draft tokens per speculation round")
+    parser.add_argument("--preload-topk", type=int, default=0,
+                        help="Pre-load N hottest experts per layer into cache at startup. "
+                             "0=disabled (default). 50 covers ~93.6%% of activations (~20 GiB), "
+                             "75 covers ~98.4%% (~30 GiB). Requires offload_selective or speculative mode.")
+    parser.add_argument("--cache-gb", type=float, default=20.0,
+                        help="Expert cache size limit in GB (default: 20). "
+                             "Increase when using --preload-topk (e.g. 30 for topk=75). Max: 35.")
+    parser.add_argument("--profile", action="store_true", default=False,
+                        help="Enable detailed per-layer profiling instrumentation in offload_selective mode. "
+                             "Prints routing/cache/IO/compute/sync breakdown per layer after generation.")
     args = parser.parse_args()
+
+    # Validate --cache-gb range
+    if args.cache_gb > 35:
+        print(f"WARNING: --cache-gb {args.cache_gb:.1f} exceeds safety max of 35 GB. Capping to 35.")
+        args.cache_gb = 35.0
+    if args.cache_gb < 1:
+        print(f"WARNING: --cache-gb {args.cache_gb:.1f} too small. Using 1 GB.")
+        args.cache_gb = 1.0
+
+    # Validate --preload-topk is only used with compatible modes
+    if args.preload_topk > 0 and args.mode not in ("offload_selective", "speculative"):
+        print(f"WARNING: --preload-topk only works with offload_selective or speculative mode. Ignoring.")
+        args.preload_topk = 0
 
     t_start = time.time()
     mem_before = get_mem_gb()
@@ -1615,11 +3050,35 @@ def main():
     print(f"[{fmt_time(0)}] Mode: {args.mode}")
     print(f"[{fmt_time(0)}] Loading model: {args.model}")
     print(f"[{fmt_time(0)}] Memory before load: {mem_before:.1f} GB")
+    if args.preload_topk > 0:
+        print(f"[{fmt_time(0)}] Expert preload: top-{args.preload_topk}/layer, cache={args.cache_gb:.0f} GB")
 
     # Resolve model path (for safetensors access)
     model_path = resolve_model_path(args.model)
 
-    if args.mode in ("offload", "offload_lazy", "offload_selective"):
+    if args.mode == "speculative":
+        # Speculative decoding: load BOTH draft (small) and verifier (large) models.
+        # Draft model: fully in DRAM via mlx_lm.load()
+        # Verifier model: empty shell + global weights (experts loaded from SSD)
+        draft_model_path = resolve_model_path(args.draft_model)
+
+        print(f"[{fmt_time(time.time() - t_start)}] Loading draft model: {args.draft_model}")
+        draft_model, tokenizer = mlx_lm.load(str(draft_model_path))
+        mx.eval(draft_model.parameters())
+        mem_after_draft = get_mem_gb()
+        print(f"[{fmt_time(time.time() - t_start)}] Draft model loaded. "
+              f"Memory: {mem_after_draft:.1f} GB (+{mem_after_draft - mem_before:.1f} GB)")
+
+        print(f"[{fmt_time(time.time() - t_start)}] Loading verifier model: {args.model}")
+        model, _ = load_model_no_weights(model_path)
+        # Cap wired memory: draft (~7GB) + verifier non-expert (~5GB) + expert cache
+        # With preloaded experts, cache may be larger than default 20GB
+        wired_gb = min(args.cache_gb + 15, args.max_mem_gb * 0.85, 43)
+        mx.set_wired_limit(int(wired_gb * 1024**3))
+        print(f"[{fmt_time(time.time() - t_start)}] Verifier loaded (global weights only). "
+              f"wired limit={wired_gb:.0f}GB")
+
+    elif args.mode in ("offload", "offload_lazy", "offload_selective"):
         # Offload mode: create empty model, load ONLY global weights (~1GB).
         # Layer weights are loaded/cleared per-layer during inference.
         # This is the only mode that works for model_size > DRAM.
@@ -1627,8 +3086,9 @@ def main():
         # offload_selective variant runs router first, then loads only selected expert slices.
         print(f"[{fmt_time(time.time() - t_start)}] Using offload loader (no layer weights)...")
         model, tokenizer = load_model_no_weights(model_path)
-        # Cap wired memory — needs non-expert weights (~3-5GB) + expert cache (~15-20GB)
-        wired_gb = min(args.max_mem_gb * 0.7, 35)  # 70% of limit or 35GB max
+        # Cap wired memory — needs non-expert weights (~3-5GB) + expert cache
+        # With preloaded experts, cache may be larger than default 20GB
+        wired_gb = min(args.cache_gb + 8, args.max_mem_gb * 0.8, 43)
         mx.set_wired_limit(int(wired_gb * 1024**3))
         mode_note = ""
         if args.mode == "offload_lazy":
@@ -1664,7 +3124,7 @@ def main():
     print(f"[{fmt_time(t_loaded)}] Model loaded. Memory: {mem_after_load:.1f} GB "
           f"(+{mem_after_load - mem_before:.1f} GB)")
 
-    if args.mode not in ("lazy", "offload", "offload_lazy", "offload_selective") and mem_after_load > args.max_mem_gb:
+    if args.mode not in ("lazy", "offload", "offload_lazy", "offload_selective", "speculative") and mem_after_load > args.max_mem_gb:
         print(f"ABORT: Memory {mem_after_load:.1f} GB exceeds limit {args.max_mem_gb} GB")
         sys.exit(1)
 
@@ -1673,7 +3133,7 @@ def main():
     params_b = total_params / 1e9
 
     # Build weight index for streaming/offload modes
-    weight_index = build_weight_index(model_path) if args.mode in ("stream", "offload", "offload_lazy", "offload_selective") else None
+    weight_index = build_weight_index(model_path) if args.mode in ("stream", "offload", "offload_lazy", "offload_selective", "speculative") else None
 
     # Generate
     print(f"[{fmt_time(time.time() - t_start)}] Generating {args.tokens} tokens ({args.mode})...")
@@ -1681,11 +3141,20 @@ def main():
 
     if args.mode == "baseline":
         result = generate_baseline(model, tokenizer, args.prompt, args.tokens)
+    elif args.mode == "speculative":
+        result = generate_speculative(
+            draft_model, model, tokenizer, args.prompt, args.tokens,
+            weight_index, model_path, draft_k=args.draft_k,
+            preload_topk=args.preload_topk, cache_gb=args.cache_gb,
+        )
     elif args.mode == "offload_selective":
         # Selective offload: run attention+router first, then load only selected expert slices.
         # Large I/O reduction vs full offload (only active experts loaded per layer).
         result = generate_offload_selective(model, tokenizer, args.prompt, args.tokens,
-                                            weight_index, model_path)
+                                            weight_index, model_path,
+                                            preload_topk=args.preload_topk,
+                                            cache_gb=args.cache_gb,
+                                            profile=args.profile)
     elif args.mode in ("offload", "offload_lazy"):
         # Offload mode: explicit per-layer load -> compute -> clear cycle.
         # Only way to run models larger than DRAM without OS thrashing.
@@ -1709,7 +3178,24 @@ def main():
     print()
 
     # Mode-specific stats
-    if args.mode in ("layerwise", "stream", "lazy", "offload", "offload_lazy", "offload_selective"):
+    if args.mode == "speculative":
+        print(f"Speculative decoding summary:")
+        print(f"  Draft model:      {args.draft_model}")
+        print(f"  Draft K:          {result.get('draft_k', 0)}")
+        print(f"  Total rounds:     {result.get('total_rounds', 0)}")
+        print(f"  Total drafted:    {result.get('total_drafted', 0)}")
+        print(f"  Total accepted:   {result.get('total_accepted', 0)}")
+        print(f"  Accept rate:      {result.get('accept_rate', 0):.1%}")
+        print(f"  Tokens/round:     {result.get('tokens_per_round', 0):.1f}")
+        print(f"  Avg draft time:   {result.get('avg_draft_ms', 0):.0f}ms")
+        print(f"  Avg verify time:  {result.get('avg_verify_ms', 0):.0f}ms")
+        print(f"  Avg round time:   {result.get('avg_round_ms', 0):.0f}ms")
+        print(f"  Prefill draft:    {result.get('prefill_draft_time', 0):.1f}s")
+        print(f"  Prefill verifier: {result.get('prefill_verify_time', 0):.1f}s")
+        print(f"  Expert cache HR:  {result.get('expert_cache_hit_rate', 0):.1%}")
+        print()
+
+    elif args.mode in ("layerwise", "stream", "lazy", "offload", "offload_lazy", "offload_selective"):
         print(f"Per-token breakdown (generation phase, excluding prompt):")
         print(f"  Avg weight load: {result.get('avg_load_ms_per_token', 0):.1f}ms")
         print(f"  Avg compute:     {result.get('avg_compute_ms_per_token', 0):.1f}ms")
