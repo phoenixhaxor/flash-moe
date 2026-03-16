@@ -38,3 +38,4 @@ a5a969f	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.49	2712	5.5	keep	ALL 60 layers packe
 9a261c3	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.27	3961	28.5	discard	pin-experts(20warm,top20) - 31% pin hit (routing diverged), 28.5GB Metal overhead
 84dbb24	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.10	2614	5.3	keep	FULL STACK: packed+no-cache+K=4+batch+lazy-eval+pipeline — 280ms/tok, 3.10 tok/s
 002128a	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.14	2518	5.4	keep	eval(inds) only + all prior opts — 278ms/tok, I/O 171ms, compute 97ms
+c8e30e4	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.04	2851	5.8	discard	async-pipeline - I/O overlapped (2.65ms!) but graph explosion: mx.eval 97→279ms
