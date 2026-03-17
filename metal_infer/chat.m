@@ -130,7 +130,7 @@ int main(int argc, char **argv) {
         const char *manifest_path = NULL;
         const char *vocab_path = NULL;
         int K = 4;
-        int cache_entries = 1500;
+        int cache_entries = 500;
         int malloc_cache_entries = 0;
 
         static struct option long_options[] = {
@@ -231,6 +231,26 @@ int main(int argc, char **argv) {
         void *layer_mmaps[NUM_LAYERS];
         size_t layer_mmap_sizes[NUM_LAYERS];
         int expert_layers_available = 0;
+
+        // Auto-detect: try 2-bit first if not explicitly set
+        if (!g_use_2bit) {
+            char probe[1024];
+            snprintf(probe, sizeof(probe), "%s/packed_experts_2bit/layer_00.bin", model_path);
+            int probe_fd = open(probe, O_RDONLY);
+            if (probe_fd >= 0) {
+                close(probe_fd);
+                // Check if 4-bit exists
+                snprintf(probe, sizeof(probe), "%s/packed_experts/layer_00.bin", model_path);
+                int probe4 = open(probe, O_RDONLY);
+                if (probe4 < 0) {
+                    // Only 2-bit exists — auto-enable
+                    g_use_2bit = 1;
+                    printf("[auto] Using 2-bit experts (4-bit not found)\n");
+                } else {
+                    close(probe4);
+                }
+            }
+        }
 
         for (int i = 0; i < NUM_LAYERS; i++) {
             char path[1024];

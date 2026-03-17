@@ -5135,6 +5135,24 @@ int main(int argc, char **argv) {
         }
         printf("\n");
 
+        // ---- Auto-detect 2-bit experts ----
+        if (!g_use_2bit) {
+            char probe[1024];
+            snprintf(probe, sizeof(probe), "%s/packed_experts_2bit/layer_00.bin", model_path);
+            int pfd = open(probe, O_RDONLY);
+            if (pfd >= 0) {
+                close(pfd);
+                snprintf(probe, sizeof(probe), "%s/packed_experts/layer_00.bin", model_path);
+                int pfd4 = open(probe, O_RDONLY);
+                if (pfd4 < 0) {
+                    g_use_2bit = 1;
+                    printf("[auto] Using 2-bit experts (4-bit not found)\n");
+                } else {
+                    close(pfd4);
+                }
+            }
+        }
+
         // ---- Open + mmap packed expert files ----
         int layer_fds[NUM_LAYERS];
         void *layer_mmaps[NUM_LAYERS];
@@ -5145,7 +5163,6 @@ int main(int argc, char **argv) {
             snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin", model_path,
                      g_use_2bit ? "packed_experts_2bit" : "packed_experts", i);
             layer_fds[i] = open(path, O_RDONLY);
-            // F_NOCACHE: bypass page cache for direct SSD access (avoids cache thrashing)
             if (layer_fds[i] >= 0 && g_use_2bit) fcntl(layer_fds[i], F_NOCACHE, 1);
             layer_mmaps[i] = MAP_FAILED;
             layer_mmap_sizes[i] = 0;
