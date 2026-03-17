@@ -59,6 +59,9 @@
 #include <errno.h>
 #include <dispatch/dispatch.h>
 #include <Accelerate/Accelerate.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <signal.h>
 
 // ============================================================================
 // Model constants
@@ -4917,6 +4920,441 @@ static void freq_print_analysis(int K) {
 }
 
 #ifndef CHAT_MODE
+
+// ============================================================================
+// HTTP Serve Mode — OpenAI-compatible /v1/chat/completions (SSE streaming)
+// ============================================================================
+
+// Read exactly n bytes from fd, returns 0 on success, -1 on error/EOF
+static int read_exact(int fd, char *buf, int n) {
+    int got = 0;
+    while (got < n) {
+        ssize_t r = read(fd, buf + got, n - got);
+        if (r <= 0) return -1;
+        got += (int)r;
+    }
+    return 0;
+}
+
+// Read HTTP request into buf (up to bufsz-1). Returns total bytes read, or -1.
+// Reads headers, then Content-Length body if present.
+static int read_http_request(int fd, char *buf, int bufsz) {
+    int total = 0;
+    // Read until we find \r\n\r\n (end of headers)
+    while (total < bufsz - 1) {
+        ssize_t r = read(fd, buf + total, 1);
+        if (r <= 0) return -1;
+        total++;
+        if (total >= 4 &&
+            buf[total-4] == '\r' && buf[total-3] == '\n' &&
+            buf[total-2] == '\r' && buf[total-1] == '\n') {
+            break;
+        }
+    }
+    buf[total] = '\0';
+
+    // Find Content-Length
+    const char *cl = strcasestr(buf, "Content-Length:");
+    if (cl) {
+        int content_len = atoi(cl + 15);
+        if (content_len > 0 && total + content_len < bufsz - 1) {
+            if (read_exact(fd, buf + total, content_len) < 0) return -1;
+            total += content_len;
+            buf[total] = '\0';
+        }
+    }
+    return total;
+}
+
+// Extract the last "content" value from an OpenAI messages array.
+// Minimal JSON parsing: find last "content":" and extract the string value.
+// Returns pointer into buf (null-terminated in place), or NULL.
+static char *extract_last_content(char *buf) {
+    char *last = NULL;
+    char *p = buf;
+    for (;;) {
+        p = strstr(p, "\"content\"");
+        if (!p) break;
+        p += 9; // skip "content"
+        // Skip whitespace and colon
+        while (*p == ' ' || *p == '\t' || *p == ':') p++;
+        if (*p == '"') {
+            p++; // skip opening quote
+            last = p;
+            // Find closing quote (handle escapes)
+            while (*p && !(*p == '"' && *(p-1) != '\\')) p++;
+        }
+    }
+    if (last) {
+        // Null-terminate the content string (overwrite closing quote)
+        char *end = last;
+        while (*end && !(*end == '"' && (end == last || *(end-1) != '\\'))) end++;
+        *end = '\0';
+        // Unescape \\n -> \n, \\" -> ", \\\\ -> backslash inline
+        char *r = last, *w = last;
+        while (*r) {
+            if (*r == '\\' && *(r+1)) {
+                r++;
+                switch (*r) {
+                    case 'n':  *w++ = '\n'; r++; break;
+                    case 't':  *w++ = '\t'; r++; break;
+                    case '"':  *w++ = '"';  r++; break;
+                    case '\\': *w++ = '\\'; r++; break;
+                    default:   *w++ = '\\'; *w++ = *r++; break;
+                }
+            } else {
+                *w++ = *r++;
+            }
+        }
+        *w = '\0';
+    }
+    return last;
+}
+
+// Extract "max_tokens" or "max_completion_tokens" from JSON body. Returns value or default.
+static int extract_max_tokens(const char *buf, int default_val) {
+    const char *p = strstr(buf, "\"max_completion_tokens\"");
+    if (!p) p = strstr(buf, "\"max_tokens\"");
+    if (!p) return default_val;
+    p = strchr(p, ':');
+    if (!p) return default_val;
+    return atoi(p + 1);
+}
+
+// Write a full HTTP response string to fd
+static void http_write(int fd, const char *data, int len) {
+    int sent = 0;
+    while (sent < len) {
+        ssize_t w = write(fd, data + sent, len - sent);
+        if (w <= 0) break;
+        sent += (int)w;
+    }
+}
+
+static void http_write_str(int fd, const char *s) {
+    http_write(fd, s, (int)strlen(s));
+}
+
+// Send an SSE chunk with a token delta
+static void sse_send_delta(int fd, const char *request_id, const char *token_text) {
+    char chunk[4096];
+    // Escape the token text for JSON
+    char escaped[2048];
+    char *w = escaped;
+    for (const char *r = token_text; *r && w < escaped + sizeof(escaped) - 8; r++) {
+        switch (*r) {
+            case '"':  *w++ = '\\'; *w++ = '"';  break;
+            case '\\': *w++ = '\\'; *w++ = '\\'; break;
+            case '\n': *w++ = '\\'; *w++ = 'n';  break;
+            case '\r': *w++ = '\\'; *w++ = 'r';  break;
+            case '\t': *w++ = '\\'; *w++ = 't';  break;
+            default:   *w++ = *r; break;
+        }
+    }
+    *w = '\0';
+    int n = snprintf(chunk, sizeof(chunk),
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
+        request_id, escaped);
+    http_write(fd, chunk, n);
+}
+
+static void sse_send_done(int fd, const char *request_id) {
+    char chunk[1024];
+    int n = snprintf(chunk, sizeof(chunk),
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+        "data: [DONE]\n\n",
+        request_id);
+    http_write(fd, chunk, n);
+}
+
+static const char *SSE_HEADERS =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/event-stream\r\n"
+    "Cache-Control: no-cache\r\n"
+    "Connection: close\r\n"
+    "Access-Control-Allow-Origin: *\r\n"
+    "\r\n";
+
+static const char *CORS_RESPONSE =
+    "HTTP/1.1 204 No Content\r\n"
+    "Access-Control-Allow-Origin: *\r\n"
+    "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+    "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+    "Access-Control-Max-Age: 86400\r\n"
+    "\r\n";
+
+// Tokenize a chat message using the Qwen3 template via encode_prompt.py.
+// Writes binary token file and loads it. Caller must free returned PromptTokens.
+static PromptTokens *tokenize_chat_message(const char *user_content) {
+    const char *text_path = "/tmp/serve_input_text.txt";
+    const char *tok_path  = "/tmp/serve_input_tokens.bin";
+
+    FILE *tf = fopen(text_path, "w");
+    if (!tf) return NULL;
+    fprintf(tf,
+        "<|im_start|>system\nYou are a helpful assistant. /think<|im_end|>\n"
+        "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
+        user_content);
+    fclose(tf);
+
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+        "python3 metal_infer/encode_prompt.py \"$(cat %s)\" -o %s 2>/dev/null",
+        text_path, tok_path);
+    int rc = system(cmd);
+    if (rc != 0) {
+        snprintf(cmd, sizeof(cmd),
+            "python3 encode_prompt.py \"$(cat %s)\" -o %s 2>/dev/null",
+            text_path, tok_path);
+        rc = system(cmd);
+    }
+    if (rc != 0) return NULL;
+
+    return load_prompt_tokens(tok_path);
+}
+
+// The main serve loop. Model state must already be initialized.
+static void serve_loop(
+    int port,
+    WeightFile *wf, Vocabulary *vocab,
+    void **layer_states, KVCache **kv_caches,
+    void **layer_mmaps, int *layer_fds,
+    float *hidden, float *logits,
+    uint16_t *final_norm_w, int K)
+{
+    // Ignore SIGPIPE (client disconnect mid-write)
+    signal(SIGPIPE, SIG_IGN);
+
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) { perror("socket"); return; }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind"); close(server_fd); return;
+    }
+    if (listen(server_fd, 8) < 0) {
+        perror("listen"); close(server_fd); return;
+    }
+
+    printf("[serve] Listening on http://0.0.0.0:%d\n", port);
+    printf("[serve] Endpoints: POST /v1/chat/completions, GET /v1/models, GET /health\n");
+    fflush(stdout);
+
+    static uint64_t req_counter = 0;
+
+    for (;;) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        if (client_fd < 0) { perror("accept"); continue; }
+
+        // Read HTTP request
+        char *reqbuf = malloc(1024 * 1024); // 1MB max request
+        int reqlen = read_http_request(client_fd, reqbuf, 1024 * 1024);
+        if (reqlen <= 0) { free(reqbuf); close(client_fd); continue; }
+
+        // Parse method and path from first line
+        char method[16] = {0}, path[256] = {0};
+        sscanf(reqbuf, "%15s %255s", method, path);
+
+        // Handle CORS preflight
+        if (strcmp(method, "OPTIONS") == 0) {
+            http_write_str(client_fd, CORS_RESPONSE);
+            free(reqbuf); close(client_fd);
+            continue;
+        }
+
+        // GET /health
+        if (strcmp(method, "GET") == 0 && strcmp(path, "/health") == 0) {
+            const char *resp =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "{\"status\":\"ok\",\"model\":\"qwen3.5-397b-a17b\"}\n";
+            http_write_str(client_fd, resp);
+            free(reqbuf); close(client_fd);
+            continue;
+        }
+
+        // GET /v1/models
+        if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/models") == 0) {
+            const char *resp =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.5-397b-a17b\","
+                "\"object\":\"model\",\"owned_by\":\"local\"}]}\n";
+            http_write_str(client_fd, resp);
+            free(reqbuf); close(client_fd);
+            continue;
+        }
+
+        // POST /v1/chat/completions
+        if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/chat/completions") == 0) {
+            // Find body (after \r\n\r\n)
+            char *body = strstr(reqbuf, "\r\n\r\n");
+            if (!body) {
+                http_write_str(client_fd,
+                    "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
+                    "{\"error\":\"no body\"}\n");
+                free(reqbuf); close(client_fd); continue;
+            }
+            body += 4;
+
+            // Extract user content from messages
+            char *content = extract_last_content(body);
+            if (!content || strlen(content) == 0) {
+                http_write_str(client_fd,
+                    "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
+                    "{\"error\":\"no content in messages\"}\n");
+                free(reqbuf); close(client_fd); continue;
+            }
+
+            int max_gen = extract_max_tokens(body, 512);
+            if (max_gen > 4096) max_gen = 4096;
+
+            char request_id[64];
+            snprintf(request_id, sizeof(request_id), "chatcmpl-%llu", ++req_counter);
+
+            fprintf(stderr, "[serve] %s content=%zu chars, max_tokens=%d\n",
+                    request_id, strlen(content), max_gen);
+
+            // Tokenize
+            PromptTokens *pt = tokenize_chat_message(content);
+            if (!pt) {
+                http_write_str(client_fd,
+                    "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
+                    "{\"error\":\"tokenization failed\"}\n");
+                free(reqbuf); close(client_fd); continue;
+            }
+
+            fprintf(stderr, "[serve] %s prompt=%d tokens\n", request_id, pt->count);
+
+            // ---- Reset state for new request ----
+            for (int i = 0; i < NUM_LAYERS; i++) {
+                if (kv_caches[i]) kv_caches[i]->len = 0;
+                if (layer_states[i]) {
+                    LinearAttnState *s = (LinearAttnState *)layer_states[i];
+                    memset(s->conv_state, 0,
+                           (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM * sizeof(float));
+                    memset(s->ssm_state, 0,
+                           LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float));
+                }
+            }
+            reset_delta_net_state();
+            int pos = 0;
+
+            // ---- Send SSE headers ----
+            http_write_str(client_fd, SSE_HEADERS);
+
+            // ---- Prefill ----
+            double t_prefill = now_ms();
+            for (int i = 0; i < pt->count; i++) {
+                embed_lookup(wf, pt->ids[i], hidden);
+                for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                    fused_layer_forward(wf, layer, hidden,
+                                        is_full ? kv_caches[layer] : NULL,
+                                        is_full ? NULL : layer_states[layer],
+                                        pos,
+                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                        K, layer_fds[layer]);
+                }
+                complete_deferred_experts();
+                pos++;
+            }
+            double prefill_ms = now_ms() - t_prefill;
+            fprintf(stderr, "[serve] %s prefill=%d tokens in %.0fms\n",
+                    request_id, pt->count, prefill_ms);
+
+            // ---- Final norm + LM head for first token ----
+            if (final_norm_w) {
+                float *normed = malloc(HIDDEN_DIM * sizeof(float));
+                cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
+                memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
+                free(normed);
+            }
+            lm_head_forward(wf, hidden, logits);
+            int next_token = cpu_argmax(logits, VOCAB_SIZE);
+
+            // ---- Auto-regressive generation with SSE streaming ----
+            double t_gen = now_ms();
+            int gen_count = 0;
+
+            for (int gen = 0; gen < max_gen; gen++) {
+                if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) break;
+
+                const char *tok_str = decode_token(vocab, next_token);
+                sse_send_delta(client_fd, request_id, tok_str);
+                gen_count++;
+
+                // Generate next
+                embed_lookup(wf, next_token, hidden);
+                for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                    fused_layer_forward(wf, layer, hidden,
+                                        is_full ? kv_caches[layer] : NULL,
+                                        is_full ? NULL : layer_states[layer],
+                                        pos,
+                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                        K, layer_fds[layer]);
+                }
+                complete_deferred_experts();
+                pos++;
+
+                if (final_norm_w) {
+                    float *normed = malloc(HIDDEN_DIM * sizeof(float));
+                    cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
+                    memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
+                    free(normed);
+                }
+                lm_head_forward(wf, hidden, logits);
+                next_token = cpu_argmax(logits, VOCAB_SIZE);
+            }
+
+            sse_send_done(client_fd, request_id);
+
+            double gen_ms = now_ms() - t_gen;
+            fprintf(stderr, "[serve] %s generated=%d tokens in %.0fms (%.2f tok/s)\n",
+                    request_id, gen_count, gen_ms,
+                    gen_count > 0 ? gen_count * 1000.0 / gen_ms : 0.0);
+
+            free(pt->ids);
+            free(pt);
+            free(reqbuf);
+            close(client_fd);
+            continue;
+        }
+
+        // Unknown endpoint
+        const char *resp404 =
+            "HTTP/1.1 404 Not Found\r\n"
+            "Content-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "{\"error\":\"not found\"}\n";
+        http_write_str(client_fd, resp404);
+        free(reqbuf);
+        close(client_fd);
+    }
+}
+
+// ============================================================================
+
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
     printf("  --model PATH         Model path\n");
@@ -4932,6 +5370,7 @@ static void print_usage(const char *prog) {
     printf("  --timing             Enable per-layer timing breakdown\n");
     printf("  --freq               Enable expert frequency tracking + analysis\n");
     printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
+    printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
     printf("  --help               This message\n");
 }
 
@@ -4947,6 +5386,7 @@ int main(int argc, char **argv) {
         int K = 4;
         int cache_entries = 1500;  // default 1500 entries (override with --cache-entries)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
+        int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
 
         static struct option long_options[] = {
             {"model",         required_argument, 0, 'm'},
@@ -4963,12 +5403,13 @@ int main(int argc, char **argv) {
             {"timing",        no_argument,       0, 'T'},
             {"freq",          no_argument,       0, 'F'},
             {"2bit",          no_argument,       0, '2'},
+            {"serve",         required_argument, 0, 'R'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:STF2h", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:STF2h", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -4984,6 +5425,7 @@ int main(int argc, char **argv) {
                 case 'T': g_timing_enabled = 1; break;
                 case 'F': g_freq_tracking = 1; break;
                 case '2': g_use_2bit = 1; break;
+                case 'R': serve_port = atoi(optarg); break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -5079,62 +5521,65 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        // ---- Get prompt tokens ----
-        if (prompt_text) {
-            // Encode via Python helper
-            snprintf(default_prompt_tokens, sizeof(default_prompt_tokens),
-                     "/tmp/metal_infer_prompt.bin");
-            char cmd[4096];
-            snprintf(cmd, sizeof(cmd),
-                     "python3 metal_infer/encode_prompt.py \"%s\" -o %s 2>/dev/null",
-                     prompt_text, default_prompt_tokens);
-            int rc = system(cmd);
-            if (rc != 0) {
-                // Try from working directory
+        // ---- Get prompt tokens (skip in serve mode) ----
+        PromptTokens *pt = NULL;
+        if (serve_port == 0) {
+            if (prompt_text) {
+                // Encode via Python helper
+                snprintf(default_prompt_tokens, sizeof(default_prompt_tokens),
+                         "/tmp/metal_infer_prompt.bin");
+                char cmd[4096];
                 snprintf(cmd, sizeof(cmd),
-                         "python3 encode_prompt.py \"%s\" -o %s 2>/dev/null",
+                         "python3 metal_infer/encode_prompt.py \"%s\" -o %s 2>/dev/null",
                          prompt_text, default_prompt_tokens);
-                rc = system(cmd);
+                int rc = system(cmd);
+                if (rc != 0) {
+                    // Try from working directory
+                    snprintf(cmd, sizeof(cmd),
+                             "python3 encode_prompt.py \"%s\" -o %s 2>/dev/null",
+                             prompt_text, default_prompt_tokens);
+                    rc = system(cmd);
+                }
+                if (rc != 0) {
+                    fprintf(stderr, "ERROR: Failed to encode prompt. Make sure encode_prompt.py exists.\n");
+                    return 1;
+                }
+                prompt_tokens_path = default_prompt_tokens;
             }
-            if (rc != 0) {
-                fprintf(stderr, "ERROR: Failed to encode prompt. Make sure encode_prompt.py exists.\n");
-                return 1;
-            }
-            prompt_tokens_path = default_prompt_tokens;
-        }
 
-        if (!prompt_tokens_path) {
-            // Default prompt
-            snprintf(default_prompt_tokens, sizeof(default_prompt_tokens),
-                     "/tmp/metal_infer_prompt.bin");
-            char cmd[4096];
-            snprintf(cmd, sizeof(cmd),
-                     "python3 metal_infer/encode_prompt.py \"Hello, what is\" -o %s 2>/dev/null",
-                     default_prompt_tokens);
-            int rc = system(cmd);
-            if (rc != 0) {
+            if (!prompt_tokens_path) {
+                // Default prompt
+                snprintf(default_prompt_tokens, sizeof(default_prompt_tokens),
+                         "/tmp/metal_infer_prompt.bin");
+                char cmd[4096];
                 snprintf(cmd, sizeof(cmd),
-                         "python3 encode_prompt.py \"Hello, what is\" -o %s 2>/dev/null",
+                         "python3 metal_infer/encode_prompt.py \"Hello, what is\" -o %s 2>/dev/null",
                          default_prompt_tokens);
-                rc = system(cmd);
+                int rc = system(cmd);
+                if (rc != 0) {
+                    snprintf(cmd, sizeof(cmd),
+                             "python3 encode_prompt.py \"Hello, what is\" -o %s 2>/dev/null",
+                             default_prompt_tokens);
+                    rc = system(cmd);
+                }
+                if (rc != 0) {
+                    fprintf(stderr, "ERROR: No prompt tokens and encode_prompt.py not found\n");
+                    return 1;
+                }
+                prompt_tokens_path = default_prompt_tokens;
             }
-            if (rc != 0) {
-                fprintf(stderr, "ERROR: No prompt tokens and encode_prompt.py not found\n");
+
+            pt = load_prompt_tokens(prompt_tokens_path);
+            if (!pt) {
+                fprintf(stderr, "ERROR: Failed to load prompt tokens from %s\n", prompt_tokens_path);
                 return 1;
             }
-            prompt_tokens_path = default_prompt_tokens;
+            printf("[prompt] %d tokens:", pt->count);
+            for (int i = 0; i < pt->count && i < 20; i++) {
+                printf(" %d", pt->ids[i]);
+            }
+            printf("\n");
         }
-
-        PromptTokens *pt = load_prompt_tokens(prompt_tokens_path);
-        if (!pt) {
-            fprintf(stderr, "ERROR: Failed to load prompt tokens from %s\n", prompt_tokens_path);
-            return 1;
-        }
-        printf("[prompt] %d tokens:", pt->count);
-        for (int i = 0; i < pt->count && i < 20; i++) {
-            printf(" %d", pt->ids[i]);
-        }
-        printf("\n");
 
         // ---- Auto-detect 2-bit experts ----
         if (!g_use_2bit) {
@@ -5212,6 +5657,19 @@ int main(int argc, char **argv) {
         // ---- Allocate working buffers ----
         float *hidden = calloc(HIDDEN_DIM, sizeof(float));
         float *logits = calloc(VOCAB_SIZE, sizeof(float));
+        uint16_t *final_norm_w = get_tensor_ptr(wf, "model.norm.weight");
+
+        // ---- Serve mode: enter HTTP server loop (never returns) ----
+        if (serve_port > 0) {
+            reset_delta_net_state();
+            serve_loop(serve_port, wf, vocab,
+                       layer_states, kv_caches,
+                       (void **)layer_mmaps, layer_fds,
+                       hidden, logits, final_norm_w, K);
+            // serve_loop never returns, but cleanup just in case
+            free(hidden); free(logits);
+            return 0;
+        }
 
         // ---- Generate tokens ----
         reset_delta_net_state();  // zero GPU delta-net state before generation
@@ -5259,7 +5717,6 @@ int main(int argc, char **argv) {
         }
 
         // ---- Final norm ----
-        uint16_t *final_norm_w = get_tensor_ptr(wf, "model.norm.weight");
         if (final_norm_w) {
             float *normed = malloc(HIDDEN_DIM * sizeof(float));
             cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
