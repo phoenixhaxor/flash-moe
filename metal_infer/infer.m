@@ -5525,8 +5525,22 @@ static const char *CORS_RESPONSE =
     "Access-Control-Max-Age: 86400\r\n"
     "\r\n";
 
-// Tokenize a chat message using the Qwen3 template via encode_prompt.py.
-// Writes binary token file and loads it. Caller must free returned PromptTokens.
+// Tokenize a user turn (system prompt already cached in KV).
+// Only encodes: <|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
+static PromptTokens *tokenize_user_turn(const char *user_content) {
+    const char *prefix = "<|im_start|>user\n";
+    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
+
+    size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + 1;
+    char *prompt = malloc(prompt_len);
+    if (!prompt) return NULL;
+    snprintf(prompt, prompt_len, "%s%s%s", prefix, user_content, suffix);
+    PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
+    free(prompt);
+    return pt;
+}
+
+// Tokenize a full chat message (system prompt + user turn) for first-time use.
 static PromptTokens *tokenize_chat_message(const char *user_content) {
     const char *prefix =
         "<|im_start|>system\nYou are a helpful assistant. /think\n"
@@ -5545,6 +5559,26 @@ static PromptTokens *tokenize_chat_message(const char *user_content) {
 }
 
 // The main serve loop. Model state must already be initialized.
+// Sync CPU linear attention state → GPU buffers
+static void sync_cpu_to_gpu_delta_state_serve(void **layer_states) {
+    if (!g_metal || !g_metal->delta_net_step || !layer_states) return;
+    int li = 0;
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        if ((i + 1) % FULL_ATTN_INTERVAL == 0) continue;
+        if (!layer_states[i]) { li++; continue; }
+        LinearAttnState *la = (LinearAttnState *)layer_states[i];
+        if (li < NUM_LINEAR_LAYERS) {
+            if (g_metal->buf_delta_state[li] && la->ssm_state)
+                memcpy([g_metal->buf_delta_state[li] contents], la->ssm_state,
+                       LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float));
+            if (g_metal->buf_conv_state[li] && la->conv_state)
+                memcpy([g_metal->buf_conv_state[li] contents], la->conv_state,
+                       (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM * sizeof(float));
+        }
+        li++;
+    }
+}
+
 static void serve_loop(
     int port,
     WeightFile *wf, Vocabulary *vocab,
@@ -5579,6 +5613,93 @@ static void serve_loop(
     fflush(stdout);
 
     static uint64_t req_counter = 0;
+
+    // ---- System prompt cache: prefill system prompt once at startup ----
+    // Tokenize the system prompt and run it through all 60 layers.
+    // Save the resulting KV cache + linear attention state as a snapshot.
+    // On each request, restore the snapshot instead of re-prefilling.
+    fprintf(stderr, "[serve] Pre-caching system prompt...\n");
+    PromptTokens *sys_pt = tokenize_chat_message("");  // empty user = just system prompt
+    int sys_pos = 0;
+    if (sys_pt && sys_pt->count > 0) {
+        for (int i = 0; i < sys_pt->count; i++) {
+            cache_telemetry_note_token();
+            embed_lookup(wf, sys_pt->ids[i], hidden);
+            for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                fused_layer_forward(wf, layer, hidden,
+                                    is_full ? kv_caches[layer] : NULL,
+                                    is_full ? NULL : layer_states[layer],
+                                    sys_pos,
+                                    layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                    K, layer_fds[layer]);
+            }
+            complete_deferred_experts();
+            sys_pos++;
+        }
+        // Sync CPU state → GPU for delta-net
+        sync_cpu_to_gpu_delta_state_serve(layer_states);
+        fprintf(stderr, "[serve] System prompt cached: %d tokens prefilled\n", sys_pos);
+    }
+    free(sys_pt);
+
+    // Save snapshot of KV caches + linear attention state after system prompt
+    // These are restored at the start of each request instead of resetting to zero
+    typedef struct {
+        float *k_snapshot;
+        float *v_snapshot;
+        int len;
+    } KVSnapshot;
+    KVSnapshot kv_snapshots[NUM_LAYERS];
+    memset(kv_snapshots, 0, sizeof(kv_snapshots));
+
+    // Linear attention snapshots
+    float *la_conv_snapshots[NUM_LAYERS];
+    float *la_ssm_snapshots[NUM_LAYERS];
+    memset(la_conv_snapshots, 0, sizeof(la_conv_snapshots));
+    memset(la_ssm_snapshots, 0, sizeof(la_ssm_snapshots));
+
+    size_t kv_dim = NUM_KV_HEADS * HEAD_DIM;
+    size_t conv_state_size = (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM * sizeof(float);
+    size_t ssm_state_size = LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float);
+
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        if (kv_caches[i]) {
+            size_t sz = sys_pos * kv_dim * sizeof(float);
+            kv_snapshots[i].k_snapshot = malloc(sz);
+            kv_snapshots[i].v_snapshot = malloc(sz);
+            memcpy(kv_snapshots[i].k_snapshot, kv_caches[i]->k_cache, sz);
+            memcpy(kv_snapshots[i].v_snapshot, kv_caches[i]->v_cache, sz);
+            kv_snapshots[i].len = kv_caches[i]->len;
+        }
+        if (layer_states[i]) {
+            LinearAttnState *s = (LinearAttnState *)layer_states[i];
+            la_conv_snapshots[i] = malloc(conv_state_size);
+            la_ssm_snapshots[i] = malloc(ssm_state_size);
+            memcpy(la_conv_snapshots[i], s->conv_state, conv_state_size);
+            memcpy(la_ssm_snapshots[i], s->ssm_state, ssm_state_size);
+        }
+    }
+    // Also snapshot GPU delta-net state
+    void *gpu_delta_snapshots[NUM_LINEAR_LAYERS];
+    void *gpu_conv_snapshots[NUM_LINEAR_LAYERS];
+    memset(gpu_delta_snapshots, 0, sizeof(gpu_delta_snapshots));
+    memset(gpu_conv_snapshots, 0, sizeof(gpu_conv_snapshots));
+    if (g_metal && g_metal->delta_net_step) {
+        for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
+            if (g_metal->buf_delta_state[i]) {
+                size_t sz = 64*128*128*sizeof(float);
+                gpu_delta_snapshots[i] = malloc(sz);
+                memcpy(gpu_delta_snapshots[i], [g_metal->buf_delta_state[i] contents], sz);
+            }
+            if (g_metal->buf_conv_state[i]) {
+                size_t sz = 3*12288*sizeof(float);
+                gpu_conv_snapshots[i] = malloc(sz);
+                memcpy(gpu_conv_snapshots[i], [g_metal->buf_conv_state[i] contents], sz);
+            }
+        }
+    }
+    int sys_prompt_len = sys_pos;  // number of tokens in system prompt cache
 
     for (;;) {
         struct sockaddr_in client_addr;
@@ -5662,7 +5783,8 @@ static void serve_loop(
                     request_id, strlen(content), max_gen);
 
             // Tokenize
-            PromptTokens *pt = tokenize_chat_message(content);
+            // System prompt is already cached — only tokenize the user turn
+            PromptTokens *pt = tokenize_user_turn(content);
             if (!pt) {
                 http_write_str(client_fd,
                     "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
@@ -5672,20 +5794,53 @@ static void serve_loop(
 
             fprintf(stderr, "[serve] %s prompt=%d tokens\n", request_id, pt->count);
 
-            // ---- Reset state for new request ----
+            // ---- Restore state from system prompt snapshot ----
+            // Instead of resetting to zero, restore to the cached system prompt state.
+            // This skips re-prefilling the system prompt tokens (~20 tokens, ~6s saved).
             for (int i = 0; i < NUM_LAYERS; i++) {
-                if (kv_caches[i]) kv_caches[i]->len = 0;
-                if (layer_states[i]) {
+                if (kv_caches[i] && kv_snapshots[i].k_snapshot) {
+                    size_t sz = sys_prompt_len * kv_dim * sizeof(float);
+                    memcpy(kv_caches[i]->k_cache, kv_snapshots[i].k_snapshot, sz);
+                    memcpy(kv_caches[i]->v_cache, kv_snapshots[i].v_snapshot, sz);
+                    kv_caches[i]->len = kv_snapshots[i].len;
+                    // Also restore GPU KV mirror
+                    if (g_metal) {
+                        int fa_idx = (i + 1) / FULL_ATTN_INTERVAL - 1;
+                        if (fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
+                            memcpy([g_metal->buf_kv_k[fa_idx] contents],
+                                   kv_snapshots[i].k_snapshot, sz);
+                            memcpy([g_metal->buf_kv_v[fa_idx] contents],
+                                   kv_snapshots[i].v_snapshot, sz);
+                        }
+                    }
+                } else if (kv_caches[i]) {
+                    kv_caches[i]->len = 0;
+                }
+                if (layer_states[i] && la_conv_snapshots[i]) {
                     LinearAttnState *s = (LinearAttnState *)layer_states[i];
-                    memset(s->conv_state, 0,
-                           (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM * sizeof(float));
-                    memset(s->ssm_state, 0,
-                           LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float));
+                    memcpy(s->conv_state, la_conv_snapshots[i], conv_state_size);
+                    memcpy(s->ssm_state, la_ssm_snapshots[i], ssm_state_size);
+                } else if (layer_states[i]) {
+                    LinearAttnState *s = (LinearAttnState *)layer_states[i];
+                    memset(s->conv_state, 0, conv_state_size);
+                    memset(s->ssm_state, 0, ssm_state_size);
                 }
             }
-            reset_delta_net_state();
+            // Restore GPU delta-net state
+            if (g_metal && g_metal->delta_net_step) {
+                for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
+                    if (gpu_delta_snapshots[i] && g_metal->buf_delta_state[i])
+                        memcpy([g_metal->buf_delta_state[i] contents],
+                               gpu_delta_snapshots[i], 64*128*128*sizeof(float));
+                    if (gpu_conv_snapshots[i] && g_metal->buf_conv_state[i])
+                        memcpy([g_metal->buf_conv_state[i] contents],
+                               gpu_conv_snapshots[i], 3*12288*sizeof(float));
+                }
+            } else {
+                reset_delta_net_state();
+            }
             if (g_cache_telemetry_enabled) cache_telemetry_reset();
-            int pos = 0;
+            int pos = sys_prompt_len;  // start after cached system prompt
 
             // ---- Send SSE headers ----
             http_write_str(client_fd, SSE_HEADERS);
