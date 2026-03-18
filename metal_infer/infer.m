@@ -5499,6 +5499,42 @@ static int extract_max_tokens(const char *buf, int default_val) {
     return atoi(p + 1);
 }
 
+// Save a conversation turn to ~/.flash-moe/sessions/<session_id>.jsonl
+// Shared data store with the chat client.
+static void server_save_turn(const char *session_id, const char *role, const char *content) {
+    if (!session_id || !session_id[0] || !content) return;
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+    char dir[1024], path[1024];
+    snprintf(dir, sizeof(dir), "%s/.flash-moe/sessions", home);
+    mkdir(dir, 0755);
+    char parent[1024];
+    snprintf(parent, sizeof(parent), "%s/.flash-moe", home);
+    mkdir(parent, 0755);
+    mkdir(dir, 0755);
+    snprintf(path, sizeof(path), "%s/%s.jsonl", dir, session_id);
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+    // JSON-escape content
+    size_t clen = strlen(content);
+    char *escaped = malloc(clen * 2 + 1);
+    int j = 0;
+    for (size_t i = 0; i < clen; i++) {
+        switch (content[i]) {
+            case '"': escaped[j++]='\\'; escaped[j++]='"'; break;
+            case '\\': escaped[j++]='\\'; escaped[j++]='\\'; break;
+            case '\n': escaped[j++]='\\'; escaped[j++]='n'; break;
+            case '\r': escaped[j++]='\\'; escaped[j++]='r'; break;
+            case '\t': escaped[j++]='\\'; escaped[j++]='t'; break;
+            default: escaped[j++]=content[i]; break;
+        }
+    }
+    escaped[j] = 0;
+    fprintf(f, "{\"role\":\"%s\",\"content\":\"%s\"}\n", role, escaped);
+    free(escaped);
+    fclose(f);
+}
+
 // Extract "session_id" string from JSON body. Copies into out_buf (max out_size).
 // Returns 1 if found, 0 if missing.
 static int extract_session_id(const char *buf, char *out_buf, int out_size) {
@@ -5899,6 +5935,9 @@ static void serve_loop(
                                    active_session_id[0] != '\0' &&
                                    strcmp(req_session_id, active_session_id) == 0);
 
+            // Save user turn to shared session store
+            if (has_session) server_save_turn(req_session_id, "user", content);
+
             char request_id[64];
             snprintf(request_id, sizeof(request_id), "chatcmpl-%llu", ++req_counter);
 
@@ -6064,6 +6103,9 @@ static void serve_loop(
             int gen_count = 0;
             int in_think = 0;
             int think_tokens = 0;
+            // Accumulate response for session persistence
+            char *gen_response = calloc(1, 256 * 1024);
+            int gen_resp_len = 0;
 
             for (int gen = 0; gen < max_gen; gen++) {
                 if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) {
@@ -6096,6 +6138,13 @@ static void serve_loop(
                 }
 
                 const char *tok_str = decode_token(vocab, next_token);
+                // Accumulate non-thinking response for session persistence
+                if (!in_think && tok_str && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
+                    int tlen = (int)strlen(tok_str);
+                    memcpy(gen_response + gen_resp_len, tok_str, tlen);
+                    gen_resp_len += tlen;
+                    gen_response[gen_resp_len] = 0;
+                }
                 if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
                     fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
                     break;
@@ -6130,6 +6179,11 @@ static void serve_loop(
             sse_send_done(client_fd, request_id);
 
             // ---- Save session state ----
+            // Save assistant response to shared session store
+            if (has_session && gen_resp_len > 0) {
+                server_save_turn(req_session_id, "assistant", gen_response);
+            }
+            free(gen_response);
             // The KV caches + linear attention state already contain this conversation.
             // Just record the position so the next request can continue from here.
             session_pos = pos;
