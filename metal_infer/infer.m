@@ -68,29 +68,29 @@
 // Model constants
 // ============================================================================
 
-#define HIDDEN_DIM          4096
-#define NUM_LAYERS          60
-#define NUM_ATTN_HEADS      32
+#define HIDDEN_DIM          2048
+#define NUM_LAYERS          40
+#define NUM_ATTN_HEADS      16
 #define NUM_KV_HEADS        2
 #define HEAD_DIM            256
 #define VOCAB_SIZE          248320
 #define RMS_NORM_EPS        1e-6f
-#define NUM_EXPERTS         512
-#define NUM_EXPERTS_PER_TOK 10
-#define MOE_INTERMEDIATE    1024
-#define SHARED_INTERMEDIATE 1024
+#define NUM_EXPERTS         256
+#define NUM_EXPERTS_PER_TOK 8
+#define MOE_INTERMEDIATE    512
+#define SHARED_INTERMEDIATE 512
 #define FULL_ATTN_INTERVAL  4
 #define GROUP_SIZE          64
 #define BITS                4
 
 // Linear attention (GatedDeltaNet) constants
-#define LINEAR_NUM_V_HEADS  64
+#define LINEAR_NUM_V_HEADS  32
 #define LINEAR_NUM_K_HEADS  16
 #define LINEAR_KEY_DIM      128   // head_k_dim
 #define LINEAR_VALUE_DIM    128   // head_v_dim
 #define LINEAR_TOTAL_KEY    (LINEAR_NUM_K_HEADS * LINEAR_KEY_DIM)   // 2048
-#define LINEAR_TOTAL_VALUE  (LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM) // 8192
-#define LINEAR_CONV_DIM     (LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE) // 12288
+#define LINEAR_TOTAL_VALUE  (LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM) // 4096
+#define LINEAR_CONV_DIM     (LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE) // 8192
 #define CONV_KERNEL_SIZE    4
 
 // Full attention constants
@@ -98,20 +98,43 @@
 #define PARTIAL_ROTARY      0.25f
 #define ROTARY_DIM          (int)(HEAD_DIM * PARTIAL_ROTARY)  // 64
 
-// Expert packed binary layout (from existing code)
-#define EXPERT_SIZE         7077888
+// Expert packed binary layout (Qwen3.5-122B-A10B: gate/up=[1024,3072], down=[3072,1024])
+#define EXPERT_SIZE         1769472
 
-// 2-bit expert layout (from repack_experts_2bit.py)
-#define EXPERT_SIZE_2BIT    3932160
+// 4-bit expert layout offsets
+#define GATE_W_OFF_4  0
+#define GATE_S_OFF_4  524288
+#define GATE_B_OFF_4  557056
+#define UP_W_OFF_4    589824
+#define UP_S_OFF_4    1114112
+#define UP_B_OFF_4    1146880
+#define DOWN_W_OFF_4  1179648
+#define DOWN_S_OFF_4  1703936
+#define DOWN_B_OFF_4  1736704
+
+// 8-bit expert layout offsets (4 values per uint32, weight tensors 2x larger than 4-bit)
+#define EXPERT_SIZE_8BIT  3342336
+#define GATE_W_OFF_8  0
+#define GATE_S_OFF_8  1048576
+#define GATE_B_OFF_8  1081344
+#define UP_W_OFF_8    1114112
+#define UP_S_OFF_8    2162688
+#define UP_B_OFF_8    2195456
+#define DOWN_W_OFF_8  2228224
+#define DOWN_S_OFF_8  3276800
+#define DOWN_B_OFF_8  3309568
+
+// 2-bit expert layout
+#define EXPERT_SIZE_2BIT    983040
 #define GATE_W_OFF_2  0
-#define GATE_S_OFF_2  1048576
-#define GATE_B_OFF_2  1179648
-#define UP_W_OFF_2    1310720
-#define UP_S_OFF_2    2359296
-#define UP_B_OFF_2    2490368
-#define DOWN_W_OFF_2  2621440
-#define DOWN_S_OFF_2  3670016
-#define DOWN_B_OFF_2  3801088
+#define GATE_S_OFF_2  262144
+#define GATE_B_OFF_2  294912
+#define UP_W_OFF_2    327680
+#define UP_S_OFF_2    589824
+#define UP_B_OFF_2    622592
+#define DOWN_W_OFF_2  655360
+#define DOWN_S_OFF_2  917504
+#define DOWN_B_OFF_2  950272
 
 // KV cache maximum context length
 #define MAX_SEQ_LEN 1048576  // 1M context — only 15 full-attn layers need KV cache, ~15GB at max
@@ -123,7 +146,7 @@
 #define THINK_START_TOKEN   248068  // <think>
 #define THINK_END_TOKEN     248069  // </think>
 
-#define MODEL_PATH_DEFAULT "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+#define MODEL_PATH_DEFAULT ""  // Use --model flag to specify path
 
 // ============================================================================
 // Timing helper
@@ -168,6 +191,7 @@ static int g_timing_enabled = 0;
 static int g_expert_freq[NUM_LAYERS][NUM_EXPERTS];  // activation count per (layer, expert)
 static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
+static int g_use_8bit = 0;       // enabled by --8bit flag: use 8-bit model weights + 8-bit kernel
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 
@@ -189,9 +213,12 @@ static inline int expert_pick_fd(int layer, int expert, int warm_fd) {
     return warm_fd;
 }
 
+// Expert offset helper: selects 2-bit, 8-bit, or 4-bit offset
+#define EXPERT_OFF(name) (g_use_2bit ? name##_OFF_2 : (g_use_8bit ? name##_OFF_8 : name##_OFF_4))
+
 // Active expert size based on quantization mode
 static inline size_t active_expert_size(void) {
-    return g_use_2bit ? EXPERT_SIZE_2BIT : EXPERT_SIZE;
+    return g_use_2bit ? EXPERT_SIZE_2BIT : (g_use_8bit ? EXPERT_SIZE_8BIT : EXPERT_SIZE);
 }
 static int g_freq_total_tokens = 0;  // total tokens processed while tracking
 
@@ -672,8 +699,12 @@ static void cpu_dequant_matvec(
     int out_dim, int in_dim, int group_size
 ) {
     int num_groups = in_dim / group_size;
-    int packed_per_group = group_size / 8;
-    int packed_cols = in_dim / 8;
+    // Bit-width aware: 4-bit = 8 vals/u32, 8-bit = 4 vals/u32, 2-bit = 16 vals/u32
+    int vals_per_u32 = g_use_8bit ? 4 : (g_use_2bit ? 16 : 8);
+    int bits = g_use_8bit ? 8 : (g_use_2bit ? 2 : 4);
+    uint32_t mask = (1u << bits) - 1;  // 0xFF for 8-bit, 0xF for 4-bit, 0x3 for 2-bit
+    int packed_per_group = group_size / vals_per_u32;
+    int packed_cols = in_dim / vals_per_u32;
 
     for (int row = 0; row < out_dim; row++) {
         float acc = 0.0f;
@@ -689,11 +720,11 @@ static void cpu_dequant_matvec(
 
             for (int p = 0; p < packed_per_group; p++) {
                 uint32_t packed = w_row[base_packed + p];
-                int x_base = base_x + p * 8;
+                int x_base = base_x + p * vals_per_u32;
 
-                for (int n = 0; n < 8; n++) {
-                    uint32_t nibble = (packed >> (n * 4)) & 0xF;
-                    acc += ((float)nibble * scale + bias) * x[x_base + n];
+                for (int n = 0; n < vals_per_u32; n++) {
+                    uint32_t val = (packed >> (n * bits)) & mask;
+                    acc += ((float)val * scale + bias) * x[x_base + n];
                 }
             }
         }
@@ -919,7 +950,7 @@ typedef struct {
     id<MTLBuffer> buf_h_mid;        // [HIDDEN_DIM floats] residual+oproj result
     id<MTLBuffer> buf_sum_sq;       // [1 float] for RMS norm reduction
     // GPU attention buffers (for full attention layers)
-    #define NUM_FULL_ATTN_LAYERS 15
+    #define NUM_FULL_ATTN_LAYERS 10
     id<MTLBuffer> buf_kv_k[NUM_FULL_ATTN_LAYERS];  // K cache per full-attn layer
     id<MTLBuffer> buf_kv_v[NUM_FULL_ATTN_LAYERS];  // V cache per full-attn layer
     id<MTLBuffer> buf_attn_q;       // [NUM_ATTN_HEADS * HEAD_DIM floats] all query heads
@@ -941,7 +972,7 @@ typedef struct {
     id<MTLComputePipelineState> compute_decay_beta; // g_decay and beta_gate for delta-net
     id<MTLComputePipelineState> gated_rms_norm;  // z-gated output normalization
     // Persistent GPU state buffers for linear attention layers
-    #define NUM_LINEAR_LAYERS 45
+    #define NUM_LINEAR_LAYERS 30
     id<MTLBuffer> buf_delta_state[NUM_LINEAR_LAYERS];   // [64*128*128] float per layer
     id<MTLBuffer> buf_conv_state[NUM_LINEAR_LAYERS];     // [3*12288] float per layer
     // Scratch buffers for delta-net inputs/outputs
@@ -1010,6 +1041,13 @@ static MetalCtx *metal_setup(void) {
     ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
     ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
+
+    // If 8-bit mode: swap matvec_v3 to 8-bit kernel so ALL matmuls use 8-bit dequant
+    if (g_use_8bit) {
+        ctx->matvec_v3   = makePipe(@"dequant_matvec_8bit");
+        ctx->matvec_fast = ctx->matvec_v3;  // fast path also uses 8-bit
+        printf("[metal] 8-bit mode: using dequant_matvec_8bit for all projections\n");
+    }
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
     ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
@@ -1062,7 +1100,7 @@ static MetalCtx *metal_setup(void) {
     }
 
     // Expert computation buffers (reused across all experts and layers)
-    ctx->buf_expert_data  = [ctx->device newBufferWithLength:EXPERT_SIZE
+    ctx->buf_expert_data  = [ctx->device newBufferWithLength:active_expert_size()
                                                      options:MTLResourceStorageModeShared];
     ctx->buf_expert_input = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
                                                      options:MTLResourceStorageModeShared];
@@ -1080,7 +1118,7 @@ static MetalCtx *metal_setup(void) {
     // The pread DMA controller transfers 3.6x faster with 2MB alignment vs 16KB.
     ctx->buf_multi_expert_input = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
                                                            options:MTLResourceStorageModeShared];
-    size_t expert_alloc_size = (EXPERT_SIZE + 2*1024*1024 - 1) & ~(2*1024*1024 - 1);  // round up to 2MB
+    size_t expert_alloc_size = (active_expert_size() + 2*1024*1024 - 1) & ~(2*1024*1024 - 1);  // round up to 2MB
     for (int k = 0; k < MAX_K; k++) {
         // 2MB-aligned allocation for optimal DMA throughput
         void *aligned_data = NULL, *aligned_data_b = NULL;
@@ -1158,26 +1196,26 @@ static MetalCtx *metal_setup(void) {
     // Persistent GPU state buffers for delta-net (linear attention layers)
     if (ctx->delta_net_step) {
         for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
-            ctx->buf_delta_state[i] = [ctx->device newBufferWithLength:64*128*128*sizeof(float)
+            ctx->buf_delta_state[i] = [ctx->device newBufferWithLength:LINEAR_NUM_V_HEADS*LINEAR_KEY_DIM*LINEAR_VALUE_DIM*sizeof(float)
                                                                options:MTLResourceStorageModeShared];
-            memset([ctx->buf_delta_state[i] contents], 0, 64*128*128*sizeof(float));
-            ctx->buf_conv_state[i] = [ctx->device newBufferWithLength:3*12288*sizeof(float)
+            memset([ctx->buf_delta_state[i] contents], 0, LINEAR_NUM_V_HEADS*LINEAR_KEY_DIM*LINEAR_VALUE_DIM*sizeof(float));
+            ctx->buf_conv_state[i] = [ctx->device newBufferWithLength:(CONV_KERNEL_SIZE-1)*LINEAR_CONV_DIM*sizeof(float)
                                                               options:MTLResourceStorageModeShared];
-            memset([ctx->buf_conv_state[i] contents], 0, 3*12288*sizeof(float));
+            memset([ctx->buf_conv_state[i] contents], 0, (CONV_KERNEL_SIZE-1)*LINEAR_CONV_DIM*sizeof(float));
         }
         // Scratch buffers for delta-net inputs/outputs (allocated once, reused)
-        ctx->buf_delta_q       = [ctx->device newBufferWithLength:2048*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_delta_k       = [ctx->device newBufferWithLength:2048*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_delta_v       = [ctx->device newBufferWithLength:8192*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_delta_g_decay = [ctx->device newBufferWithLength:64*sizeof(float)    options:MTLResourceStorageModeShared];
-        ctx->buf_delta_beta    = [ctx->device newBufferWithLength:64*sizeof(float)    options:MTLResourceStorageModeShared];
-        ctx->buf_delta_output  = [ctx->device newBufferWithLength:8192*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_conv_input    = [ctx->device newBufferWithLength:12288*sizeof(float) options:MTLResourceStorageModeShared];
-        ctx->buf_conv_output   = [ctx->device newBufferWithLength:12288*sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_delta_q       = [ctx->device newBufferWithLength:LINEAR_TOTAL_KEY*sizeof(float)    options:MTLResourceStorageModeShared];
+        ctx->buf_delta_k       = [ctx->device newBufferWithLength:LINEAR_TOTAL_KEY*sizeof(float)    options:MTLResourceStorageModeShared];
+        ctx->buf_delta_v       = [ctx->device newBufferWithLength:LINEAR_TOTAL_VALUE*sizeof(float)  options:MTLResourceStorageModeShared];
+        ctx->buf_delta_g_decay = [ctx->device newBufferWithLength:LINEAR_NUM_V_HEADS*sizeof(float)  options:MTLResourceStorageModeShared];
+        ctx->buf_delta_beta    = [ctx->device newBufferWithLength:LINEAR_NUM_V_HEADS*sizeof(float)  options:MTLResourceStorageModeShared];
+        ctx->buf_delta_output  = [ctx->device newBufferWithLength:LINEAR_TOTAL_VALUE*sizeof(float)  options:MTLResourceStorageModeShared];
+        ctx->buf_conv_input    = [ctx->device newBufferWithLength:LINEAR_CONV_DIM*sizeof(float)     options:MTLResourceStorageModeShared];
+        ctx->buf_conv_output   = [ctx->device newBufferWithLength:LINEAR_CONV_DIM*sizeof(float)     options:MTLResourceStorageModeShared];
         printf("[metal] Delta-net GPU buffers: %d layers (%.1f MB state + %.1f MB scratch)\n",
                NUM_LINEAR_LAYERS,
-               NUM_LINEAR_LAYERS * (64*128*128*4 + 3*12288*4) / 1e6,
-               (2048+2048+8192+64+64+8192+12288+12288) * 4 / 1e6);
+               NUM_LINEAR_LAYERS * (LINEAR_NUM_V_HEADS*LINEAR_KEY_DIM*LINEAR_VALUE_DIM*4 + (CONV_KERNEL_SIZE-1)*LINEAR_CONV_DIM*4) / 1e6,
+               (LINEAR_TOTAL_KEY*2+LINEAR_TOTAL_VALUE*2+LINEAR_NUM_V_HEADS*2+LINEAR_CONV_DIM*2) * 4 / 1e6);
     }
 
     // Create shared event for CPU-GPU async pipeline
@@ -1193,9 +1231,9 @@ static void reset_delta_net_state(void) {
     if (!g_metal || !g_metal->delta_net_step) return;
     for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
         if (g_metal->buf_delta_state[i])
-            memset([g_metal->buf_delta_state[i] contents], 0, 64*128*128*sizeof(float));
+            memset([g_metal->buf_delta_state[i] contents], 0, LINEAR_NUM_V_HEADS*LINEAR_KEY_DIM*LINEAR_VALUE_DIM*sizeof(float));
         if (g_metal->buf_conv_state[i])
-            memset([g_metal->buf_conv_state[i] contents], 0, 3*12288*sizeof(float));
+            memset([g_metal->buf_conv_state[i] contents], 0, (CONV_KERNEL_SIZE-1)*LINEAR_CONV_DIM*sizeof(float));
     }
 }
 
@@ -1473,13 +1511,13 @@ static void gpu_encode_expert_forward_slot(
     NSUInteger up_w_off, up_s_off, up_b_off;
     NSUInteger down_w_off, down_s_off, down_b_off;
     if (g_use_2bit) {
-        gate_w_off = GATE_W_OFF_2; gate_s_off = GATE_S_OFF_2; gate_b_off = GATE_B_OFF_2;
-        up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
-        down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
+        gate_w_off = EXPERT_OFF(GATE_W); gate_s_off = EXPERT_OFF(GATE_S); gate_b_off = EXPERT_OFF(GATE_B);
+        up_w_off   = EXPERT_OFF(UP_W);   up_s_off   = EXPERT_OFF(UP_S);   up_b_off   = EXPERT_OFF(UP_B);
+        down_w_off = EXPERT_OFF(DOWN_W); down_s_off = EXPERT_OFF(DOWN_S); down_b_off = EXPERT_OFF(DOWN_B);
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = EXPERT_OFF(GATE_W); gate_s_off = EXPERT_OFF(GATE_S); gate_b_off = EXPERT_OFF(GATE_B);
+        up_w_off   = EXPERT_OFF(UP_W);   up_s_off   = EXPERT_OFF(UP_S);   up_b_off   = EXPERT_OFF(UP_B);
+        down_w_off = EXPERT_OFF(DOWN_W); down_s_off = EXPERT_OFF(DOWN_S); down_b_off = EXPERT_OFF(DOWN_B);
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -1569,13 +1607,13 @@ static void gpu_encode_expert_forward_slot_buf(
     NSUInteger up_w_off, up_s_off, up_b_off;
     NSUInteger down_w_off, down_s_off, down_b_off;
     if (g_use_2bit) {
-        gate_w_off = GATE_W_OFF_2; gate_s_off = GATE_S_OFF_2; gate_b_off = GATE_B_OFF_2;
-        up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
-        down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
+        gate_w_off = EXPERT_OFF(GATE_W); gate_s_off = EXPERT_OFF(GATE_S); gate_b_off = EXPERT_OFF(GATE_B);
+        up_w_off   = EXPERT_OFF(UP_W);   up_s_off   = EXPERT_OFF(UP_S);   up_b_off   = EXPERT_OFF(UP_B);
+        down_w_off = EXPERT_OFF(DOWN_W); down_s_off = EXPERT_OFF(DOWN_S); down_b_off = EXPERT_OFF(DOWN_B);
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = EXPERT_OFF(GATE_W); gate_s_off = EXPERT_OFF(GATE_S); gate_b_off = EXPERT_OFF(GATE_B);
+        up_w_off   = EXPERT_OFF(UP_W);   up_s_off   = EXPERT_OFF(UP_S);   up_b_off   = EXPERT_OFF(UP_B);
+        down_w_off = EXPERT_OFF(DOWN_W); down_s_off = EXPERT_OFF(DOWN_S); down_b_off = EXPERT_OFF(DOWN_B);
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -1669,13 +1707,13 @@ static void gpu_encode_experts_batched(
     NSUInteger up_w_off, up_s_off, up_b_off;
     NSUInteger down_w_off, down_s_off, down_b_off;
     if (g_use_2bit) {
-        gate_w_off = GATE_W_OFF_2; gate_s_off = GATE_S_OFF_2; gate_b_off = GATE_B_OFF_2;
-        up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
-        down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
+        gate_w_off = EXPERT_OFF(GATE_W); gate_s_off = EXPERT_OFF(GATE_S); gate_b_off = EXPERT_OFF(GATE_B);
+        up_w_off   = EXPERT_OFF(UP_W);   up_s_off   = EXPERT_OFF(UP_S);   up_b_off   = EXPERT_OFF(UP_B);
+        down_w_off = EXPERT_OFF(DOWN_W); down_s_off = EXPERT_OFF(DOWN_S); down_b_off = EXPERT_OFF(DOWN_B);
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = EXPERT_OFF(GATE_W); gate_s_off = EXPERT_OFF(GATE_S); gate_b_off = EXPERT_OFF(GATE_B);
+        up_w_off   = EXPERT_OFF(UP_W);   up_s_off   = EXPERT_OFF(UP_S);   up_b_off   = EXPERT_OFF(UP_B);
+        down_w_off = EXPERT_OFF(DOWN_W); down_s_off = EXPERT_OFF(DOWN_S); down_b_off = EXPERT_OFF(DOWN_B);
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -1758,15 +1796,15 @@ static void gpu_encode_expert_forward(
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf
 ) {
-    NSUInteger gate_w_off = 0;
-    NSUInteger gate_s_off = 2097152;
-    NSUInteger gate_b_off = 2228224;
-    NSUInteger up_w_off   = 2359296;
-    NSUInteger up_s_off   = 4456448;
-    NSUInteger up_b_off   = 4587520;
-    NSUInteger down_w_off = 4718592;
-    NSUInteger down_s_off = 6815744;
-    NSUInteger down_b_off = 6946816;
+    NSUInteger gate_w_off = EXPERT_OFF(GATE_W);
+    NSUInteger gate_s_off = EXPERT_OFF(GATE_S);
+    NSUInteger gate_b_off = EXPERT_OFF(GATE_B);
+    NSUInteger up_w_off   = EXPERT_OFF(UP_W);
+    NSUInteger up_s_off   = EXPERT_OFF(UP_S);
+    NSUInteger up_b_off   = EXPERT_OFF(UP_B);
+    NSUInteger down_w_off = EXPERT_OFF(DOWN_W);
+    NSUInteger down_s_off = EXPERT_OFF(DOWN_S);
+    NSUInteger down_b_off = EXPERT_OFF(DOWN_B);
 
     uint32_t gate_up_out = MOE_INTERMEDIATE;
     uint32_t gate_up_in  = HIDDEN_DIM;
@@ -1878,13 +1916,13 @@ static void gpu_expert_forward(
     NSUInteger up_w_off, up_s_off, up_b_off;
     NSUInteger down_w_off, down_s_off, down_b_off;
     if (g_use_2bit) {
-        gate_w_off = GATE_W_OFF_2; gate_s_off = GATE_S_OFF_2; gate_b_off = GATE_B_OFF_2;
-        up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
-        down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
+        gate_w_off = EXPERT_OFF(GATE_W); gate_s_off = EXPERT_OFF(GATE_S); gate_b_off = EXPERT_OFF(GATE_B);
+        up_w_off   = EXPERT_OFF(UP_W);   up_s_off   = EXPERT_OFF(UP_S);   up_b_off   = EXPERT_OFF(UP_B);
+        down_w_off = EXPERT_OFF(DOWN_W); down_s_off = EXPERT_OFF(DOWN_S); down_b_off = EXPERT_OFF(DOWN_B);
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = EXPERT_OFF(GATE_W); gate_s_off = EXPERT_OFF(GATE_S); gate_b_off = EXPERT_OFF(GATE_B);
+        up_w_off   = EXPERT_OFF(UP_W);   up_s_off   = EXPERT_OFF(UP_S);   up_b_off   = EXPERT_OFF(UP_B);
+        down_w_off = EXPERT_OFF(DOWN_W); down_s_off = EXPERT_OFF(DOWN_S); down_b_off = EXPERT_OFF(DOWN_B);
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -2721,14 +2759,14 @@ static void moe_forward(
                 }
 
                 uint32_t *gw = (uint32_t *)expert_data;
-                uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : 2097152));
-                uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : 2228224));
-                uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : 2359296));
-                uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : 4456448));
-                uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : 4587520));
-                uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : 4718592));
-                uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : 6815744));
-                uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : 6946816));
+                uint16_t *gs_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(GATE_S)));
+                uint16_t *gb_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(GATE_B)));
+                uint32_t *uw = (uint32_t *)((char *)expert_data + (EXPERT_OFF(UP_W)));
+                uint16_t *us_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(UP_S)));
+                uint16_t *ub_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(UP_B)));
+                uint32_t *dw = (uint32_t *)((char *)expert_data + (EXPERT_OFF(DOWN_W)));
+                uint16_t *ds_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(DOWN_S)));
+                uint16_t *db_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(DOWN_B)));
 
                 float *gate_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
                 float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
@@ -2853,8 +2891,12 @@ static void embed_lookup(WeightFile *wf, int token_id, float *out) {
     const uint16_t *s_row = S + (size_t)token_id * num_groups;
     const uint16_t *b_row = B + (size_t)token_id * num_groups;
 
-    int group_size = HIDDEN_DIM / num_groups;  // 4096/64 = 64
-    int packed_per_group = group_size / 8;     // 8
+    int group_size = HIDDEN_DIM / num_groups;  // 2048/32 = 64
+    // Bit-width aware: 4-bit = 8 vals/u32, 8-bit = 4 vals/u32
+    int vals_per_u32 = g_use_8bit ? 4 : 8;
+    int bits = g_use_8bit ? 8 : 4;
+    uint32_t mask = (1u << bits) - 1;
+    int packed_per_group = group_size / vals_per_u32;
 
     for (int g = 0; g < num_groups; g++) {
         float scale = bf16_to_f32(s_row[g]);
@@ -2862,11 +2904,11 @@ static void embed_lookup(WeightFile *wf, int token_id, float *out) {
 
         for (int p = 0; p < packed_per_group; p++) {
             uint32_t packed = w_row[g * packed_per_group + p];
-            int base = g * group_size + p * 8;
+            int base = g * group_size + p * vals_per_u32;
 
-            for (int n = 0; n < 8; n++) {
-                uint32_t nibble = (packed >> (n * 4)) & 0xF;
-                out[base + n] = (float)nibble * scale + bias;
+            for (int n = 0; n < vals_per_u32; n++) {
+                uint32_t val = (packed >> (n * bits)) & mask;
+                out[base + n] = (float)val * scale + bias;
             }
         }
     }
@@ -3731,8 +3773,6 @@ static void finalize_deferred_experts(void) {
 
     if (g_deferred.gpu_combined) {
         // GPU-side combine: hidden state is already in buf_moe_hidden.
-        // buf_input already has the normalized input for the next layer's CMD1.
-        // Just read back hidden (needed for the residual connection in future layers).
         memcpy(g_deferred.hidden, [g_metal->buf_moe_hidden contents],
                HIDDEN_DIM * sizeof(float));
     } else {
@@ -4227,6 +4267,7 @@ static void fused_layer_forward(
             if (!gpu_linear_attn) {
                 gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
             }
+
         }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
     }
@@ -4875,14 +4916,12 @@ static void fused_layer_forward(
             fast_dequant_matvec(oproj_w, oproj_s, oproj_b, attn_out_for_oproj,
                                 attn_projected, HIDDEN_DIM, oproj_in_dim, GROUP_SIZE);
         }
-        // attn_out_for_oproj is static — no free needed
         attn_out_for_oproj = NULL;
 
         // Residual connection
         for (int i = 0; i < HIDDEN_DIM; i++) {
             hidden[i] = residual[i] + attn_projected[i];
         }
-        // attn_projected, normed, residual are static — no free needed
 
         cpu_vec_copy(h_mid, hidden, HIDDEN_DIM);
 
@@ -5247,14 +5286,14 @@ static void fused_layer_forward(
 
             // CPU fallback offsets — use 4-bit layout (2-bit CPU path not yet implemented)
             uint32_t *gw = (uint32_t *)expert_data;
-            uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : 2097152));
-            uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : 2228224));
-            uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : 2359296));
-            uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : 4456448));
-            uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : 4587520));
-            uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : 4718592));
-            uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : 6815744));
-            uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : 6946816));
+            uint16_t *gs_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(GATE_S)));
+            uint16_t *gb_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(GATE_B)));
+            uint32_t *uw = (uint32_t *)((char *)expert_data + (EXPERT_OFF(UP_W)));
+            uint16_t *us_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(UP_S)));
+            uint16_t *ub_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(UP_B)));
+            uint32_t *dw = (uint32_t *)((char *)expert_data + (EXPERT_OFF(DOWN_W)));
+            uint16_t *ds_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(DOWN_S)));
+            uint16_t *db_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(DOWN_B)));
 
             float *gate_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
             float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
@@ -5875,12 +5914,12 @@ static void serve_loop(
     if (g_metal && g_metal->delta_net_step) {
         for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
             if (g_metal->buf_delta_state[i]) {
-                size_t sz = 64*128*128*sizeof(float);
+                size_t sz = LINEAR_NUM_V_HEADS*LINEAR_KEY_DIM*LINEAR_VALUE_DIM*sizeof(float);
                 gpu_delta_snapshots[i] = malloc(sz);
                 memcpy(gpu_delta_snapshots[i], [g_metal->buf_delta_state[i] contents], sz);
             }
             if (g_metal->buf_conv_state[i]) {
-                size_t sz = 3*12288*sizeof(float);
+                size_t sz = (CONV_KERNEL_SIZE-1)*LINEAR_CONV_DIM*sizeof(float);
                 gpu_conv_snapshots[i] = malloc(sz);
                 memcpy(gpu_conv_snapshots[i], [g_metal->buf_conv_state[i] contents], sz);
             }
@@ -6049,10 +6088,10 @@ static void serve_loop(
                     for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
                         if (gpu_delta_snapshots[i] && g_metal->buf_delta_state[i])
                             memcpy([g_metal->buf_delta_state[i] contents],
-                                   gpu_delta_snapshots[i], 64*128*128*sizeof(float));
+                                   gpu_delta_snapshots[i], LINEAR_NUM_V_HEADS*LINEAR_KEY_DIM*LINEAR_VALUE_DIM*sizeof(float));
                         if (gpu_conv_snapshots[i] && g_metal->buf_conv_state[i])
                             memcpy([g_metal->buf_conv_state[i] contents],
-                                   gpu_conv_snapshots[i], 3*12288*sizeof(float));
+                                   gpu_conv_snapshots[i], (CONV_KERNEL_SIZE-1)*LINEAR_CONV_DIM*sizeof(float));
                     }
                 } else {
                     reset_delta_net_state();
@@ -6314,6 +6353,7 @@ int main(int argc, char **argv) {
             {"freq",          no_argument,       0, 'F'},
             {"cache-telemetry", no_argument,     0, 'E'},
             {"2bit",          no_argument,       0, '2'},
+            {"8bit",          no_argument,       0, '8'},
             {"gpu-linear",    no_argument,       0, 'G'},
             {"think-budget",  required_argument, 0, 'B'},
             {"serve",         required_argument, 0, 'R'},
@@ -6340,6 +6380,7 @@ int main(int argc, char **argv) {
                 case 'F': g_freq_tracking = 1; break;
                 case 'E': g_cache_telemetry_enabled = 1; break;
                 case '2': g_use_2bit = 1; break;
+                case '8': g_use_8bit = 1; break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'B': g_think_budget = atoi(optarg); break;
                 case 'R': serve_port = atoi(optarg); break;
@@ -6505,7 +6546,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < NUM_LAYERS; i++) {
             char path[1024];
             snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin", model_path,
-                     g_use_2bit ? "packed_experts_2bit" : "packed_experts", i);
+                     g_use_2bit ? "packed_experts_2bit" : (g_use_8bit ? "packed_experts_8bit" : "packed_experts"), i);
             layer_fds[i] = open(path, O_RDONLY);
             layer_fds_cold[i] = -1;  // no longer used (trust OS page cache)
             layer_mmaps[i] = MAP_FAILED;

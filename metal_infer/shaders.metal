@@ -414,6 +414,74 @@ kernel void dequant_matvec_2bit(
 
 
 // ============================================================================
+// Kernel 1f: 8-bit affine dequant matvec (same structure as v3)
+// ============================================================================
+// Packs 4 x 8-bit values per uint32. Each value is 0-255, dequantized as:
+//   val = uint8 * scale + bias (same affine quantization, 8-bit range)
+// Same group structure: group_size elements share one (scale, bias) pair.
+// packed_cols = in_dim / 4 (4 values per uint32, vs 8 for 4-bit)
+
+kernel void dequant_matvec_8bit(
+    device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/4]
+    device const uint16_t* scales     [[buffer(1)]],  // [out_dim, num_groups] bf16
+    device const uint16_t* biases     [[buffer(2)]],  // [out_dim, num_groups] bf16
+    device const float*    x          [[buffer(3)]],  // [in_dim]
+    device float*          out        [[buffer(4)]],  // [out_dim]
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    uint packed_cols = in_dim / 4;      // 4 x 8-bit values per uint32
+    uint num_groups  = in_dim / group_size;
+
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales + row * num_groups;
+    device const uint16_t* b_row = biases + row * num_groups;
+
+    float acc = 0.0f;
+
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        // group_size=64 → 16 packed cols per group (64/4)
+        uint g = col / (group_size / 4);
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        uint32_t packed = w_row[col];
+        uint x_base = col * 4;
+
+        // Extract 4 bytes from uint32
+        float x0 = x_shared[x_base + 0];
+        float x1 = x_shared[x_base + 1];
+        float x2 = x_shared[x_base + 2];
+        float x3 = x_shared[x_base + 3];
+
+        acc += (float((packed >>  0) & 0xFF) * scale + bias) * x0;
+        acc += (float((packed >>  8) & 0xFF) * scale + bias) * x1;
+        acc += (float((packed >> 16) & 0xFF) * scale + bias) * x2;
+        acc += (float((packed >> 24) & 0xFF) * scale + bias) * x3;
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+
+// ============================================================================
 // Kernel 1d: FULLY OPTIMIZED with uint4 vector loads
 // ============================================================================
 //

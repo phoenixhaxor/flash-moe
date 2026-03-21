@@ -7,11 +7,20 @@ metal_infer/bench_pread
 *.air
 *.metallib
 
-# Generated model files (recreate with scripts — see CLAUDE.md Quick Start)
+# Generated model files (recreate with scripts — see README.md)
 metal_infer/model_weights.bin
 metal_infer/model_weights.json
 metal_infer/vocab.bin
 metal_infer/tokenizer.bin
+metal_infer/expert_index.json
+metal_infer/packed_experts/
+metal_infer/packed_experts_2bit/
+metal_infer/packed_experts_8bit/
+qwen35-custom-8bit/
+
+# Server runtime
+serve.log
+.serve.pid
 
 # Python
 __pycache__/
