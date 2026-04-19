@@ -6265,7 +6265,7 @@ static char *load_system_prompt(void) {
             return buf;
         }
     }
-    return strdup("You are a helpful assistant. /no_think");
+    return strdup("You are a helpful assistant.");
 }
 
 // Tokenize a full chat message (system prompt + user turn) for first-time use.
@@ -7176,6 +7176,13 @@ static void serve_loop(
                         memcpy(kv_caches[i]->k_cache, kv_snapshots[i].k_snapshot, sz);
                         memcpy(kv_caches[i]->v_cache, kv_snapshots[i].v_snapshot, sz);
                         kv_caches[i]->len = kv_snapshots[i].len;
+                        // Reset hybrid KV cache to prevent stale data from previous requests
+                        if (kv_caches[i]->hybrid) {
+                            kv_caches[i]->hybrid->qk->len = 0;
+                            kv_caches[i]->hybrid->qv->len = 0;
+                            kv_caches[i]->hybrid->recent_len = 0;
+                            kv_caches[i]->hybrid->total_len = 0;
+                        }
                         // Also restore GPU KV mirror
                         if (g_metal) {
                             int fa_idx = (i + 1) / FULL_ATTN_INTERVAL - 1;
@@ -7184,6 +7191,14 @@ static void serve_loop(
                                        kv_snapshots[i].k_snapshot, sz);
                                 memcpy([g_metal->buf_kv_v[fa_idx] contents],
                                        kv_snapshots[i].v_snapshot, sz);
+                                // Zero GPU KV beyond system prompt
+                                size_t gpu_total = GPU_KV_SEQ * kv_dim * sizeof(float);
+                                if (gpu_total > sz) {
+                                    memset((float *)[g_metal->buf_kv_k[fa_idx] contents] + sys_prompt_len * kv_dim,
+                                           0, gpu_total - sz);
+                                    memset((float *)[g_metal->buf_kv_v[fa_idx] contents] + sys_prompt_len * kv_dim,
+                                           0, gpu_total - sz);
+                                }
                             }
                         }
                     } else if (kv_caches[i]) {
