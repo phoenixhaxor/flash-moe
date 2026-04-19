@@ -1,8 +1,8 @@
 # flash-moe (Multi-Model Fork)
 
-Pure C/Metal inference engine that streams Qwen3.5 Mixture-of-Experts models from SSD on Apple Silicon Macs. Models much larger than available RAM run by keeping only attention weights in memory and streaming expert weights from disk on demand.
+Pure C/Metal inference engine that streams Qwen3.5/Qwen3.6 Mixture-of-Experts models from SSD on Apple Silicon Macs. Models much larger than available RAM run by keeping only attention weights in memory and streaming expert weights from disk on demand.
 
-> Fork of [danveloper/flash-moe](https://github.com/danveloper/flash-moe) adapted for multiple Qwen3.5 MoE model sizes. Inspired by [Karpathy's autoresearch](https://github.com/karpathy) and Apple's ["LLM in a Flash"](https://arxiv.org/abs/2312.11514) paper (Alizadeh et al.).
+> Fork of [danveloper/flash-moe](https://github.com/danveloper/flash-moe) adapted for multiple Qwen3.5/3.6 MoE model sizes. Inspired by [Karpathy's autoresearch](https://github.com/karpathy) and Apple's [\"LLM in a Flash\"](https://arxiv.org/abs/2312.11514) paper (Alizadeh et al.).
 
 ## What This Is
 
@@ -15,10 +15,11 @@ Pure C/Metal inference engine that streams Qwen3.5 Mixture-of-Experts models fro
 
 ## Supported Models
 
-| Model | Total Params | Active Params | 4-bit Disk | 2-bit Disk | Speed (M4 Pro 24GB) |
-|-------|-------------|---------------|-----------|-----------|---------------------|
-| Qwen3.5-35B-A3B | 35B | 3B | ~18 GB | ~10 GB | ~11 / 20 tok/s |
-| Qwen3.5-122B-A10B | 122B | 10B | ~65 GB | ~36 GB | ~3 / 6.5 tok/s |
+| Model | Total Params | Active Params | 4-bit Disk | 8-bit Disk | 2-bit Disk | Speed (M4 Pro 24GB) |
+|-------|-------------|---------------|-----------|-----------|-----------|---------------------|
+| Qwen3.5-35B-A3B | 35B | 3B | ~18 GB | — | ~10 GB | ~11 / 20 tok/s |
+| Qwen3.6-35B-A3B | 35B | 3B | — | ~18 GB | — | ~17 / 20 tok/s |
+| Qwen3.5-122B-A10B | 122B | 10B | ~65 GB | — | ~36 GB | ~3 / 6.5 tok/s |
 
 Speed format: prefill / decode tokens per second (approximate, varies by prompt and cache state).
 
@@ -61,6 +62,12 @@ This single command will:
 4. Pack expert weights into `metal_infer/packed_experts/` (one file per layer)
 
 For the 35B model, use `--model-id mlx-community/Qwen3.5-35B-A3B-4bit` instead.
+
+For **Qwen3.6 8-bit** (recommended — higher quality, same speed):
+
+```bash
+python setup_model.py --model-id mlx-community/Qwen3.6-35B-A3B-8bit --bits 8
+```
 
 You can also run individual steps if the download is already cached:
 
@@ -116,8 +123,16 @@ ln -s /path/to/packed_experts packed_experts
 
 ### 8. Run inference
 
+**4-bit / 2-bit models (Qwen3.5):**
+
 ```bash
 ./infer --prompt "Hello, what is quantum computing?" --tokens 100 --k 8
+```
+
+**8-bit models (Qwen3.6):**
+
+```bash
+./infer --8bit --prompt "Hello, what is quantum computing?" --tokens 100
 ```
 
 Key flags:
@@ -128,7 +143,8 @@ Key flags:
 | `--tokens N` | Maximum tokens to generate (default: 20) |
 | `--k N` | Active experts per layer (default: 4, model default: 8) |
 | `--2bit` | Use 2-bit quantized experts (faster, requires `packed_experts_2bit/`) |
-| `--model PATH` | Model directory path |
+| `--8bit` | Use 8-bit MLX quantized model (Qwen3.6, requires `packed_experts_8bit/`) |
+| `--model PATH` | Model directory path (default: current directory) |
 | `--serve PORT` | Start OpenAI-compatible HTTP server on PORT |
 | `--timing` | Print per-layer timing breakdown |
 | `--think-budget N` | Max thinking tokens before forcing `</think>` (default: 2048) |
