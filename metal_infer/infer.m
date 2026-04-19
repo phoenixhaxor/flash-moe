@@ -683,8 +683,14 @@ static Vocabulary *load_vocab(const char *path) {
 }
 
 static const char *decode_token(Vocabulary *v, int token_id) {
+    // Handle special tokens not in vocab
+    if (token_id == THINK_START_TOKEN) return "";  // suppress thinking markers
+    if (token_id == THINK_END_TOKEN) return "";     // suppress thinking markers
+    if (token_id == 151643) return "";              // <|endoftext|> — suppress
+    if (token_id == 248045) return "";              // <|im_start|> — suppress
+    if (token_id == 248046) return "";              // <|im_end|> — suppress (also EOS)
     if (token_id < 0 || token_id >= v->num_tokens || !v->tokens[token_id]) {
-        return "<unk>";
+        return "";  // unknown token — suppress instead of emitting <unk>
     }
     return v->tokens[token_id];
 }
@@ -1056,11 +1062,11 @@ static int cpu_argmax(const float *x, int dim) {
     return best;
 }
 
-// Suppress thinking token in logits (set to -inf so argmax never picks it)
+// Suppress thinking token in logits (disabled — let model decide via /no_think system prompt)
+// Previously set logits[THINK_START_TOKEN] = -inf, which caused gibberish output.
 static void suppress_think_token(float *logits) {
-    if (g_no_think) {
-        logits[THINK_START_TOKEN] = -1e30f;
-    }
+    // No-op: Qwen3.6 models respect /no_think in system prompt natively.
+    // Filtering of thinking tokens is done in the output stage, not logits.
 }
 
 // SiLU activation
@@ -6259,7 +6265,7 @@ static char *load_system_prompt(void) {
             return buf;
         }
     }
-    return strdup("You are a helpful assistant. /think");
+    return strdup("You are a helpful assistant. /no_think");
 }
 
 // Tokenize a full chat message (system prompt + user turn) for first-time use.
@@ -7349,15 +7355,18 @@ static void serve_loop(
 
                     // Emit the first token (already verified from previous iteration)
                     const char *tok_str = decode_token(vocab, next_token);
-                    if (!in_think && tok_str && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
+                    if (!in_think && tok_str[0] != '\0' && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
                         int tlen = (int)strlen(tok_str);
                         memcpy(gen_response + gen_resp_len, tok_str, tlen);
                         gen_resp_len += tlen;
                         gen_response[gen_resp_len] = 0;
                     }
-                    if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
-                        fprintf(stderr, "[serve] %s client disconnected\n", request_id);
-                        break;
+                    // Only send non-thinking, non-empty tokens via SSE
+                    if (tok_str[0] != '\0' && !in_think) {
+                        if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
+                            fprintf(stderr, "[serve] %s client disconnected\n", request_id);
+                            break;
+                        }
                     }
                     gen_count++;
 
@@ -7439,15 +7448,18 @@ static void serve_loop(
                         if (draft_tokens[a] == THINK_END_TOKEN) in_think = 0;
 
                         const char *ds = decode_token(vocab, draft_tokens[a]);
-                        if (!in_think && ds && gen_resp_len + (int)strlen(ds) < 256*1024 - 1) {
+                        if (!in_think && ds[0] != '\0' && gen_resp_len + (int)strlen(ds) < 256*1024 - 1) {
                             int dlen = (int)strlen(ds);
                             memcpy(gen_response + gen_resp_len, ds, dlen);
                             gen_resp_len += dlen;
                             gen_response[gen_resp_len] = 0;
                         }
-                        if (sse_send_delta(client_fd, request_id, ds) < 0) {
-                            fprintf(stderr, "[serve] %s client disconnected\n", request_id);
-                            goto spec_done;
+                        // Only send non-thinking, non-empty tokens via SSE
+                        if (ds[0] != '\0' && !in_think) {
+                            if (sse_send_delta(client_fd, request_id, ds) < 0) {
+                                fprintf(stderr, "[serve] %s client disconnected\n", request_id);
+                                goto spec_done;
+                            }
                         }
                         gen_count++;
                     }
@@ -7502,15 +7514,18 @@ static void serve_loop(
 
                 const char *tok_str = decode_token(vocab, next_token);
                 // Accumulate non-thinking response for session persistence
-                if (!in_think && tok_str && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
+                if (!in_think && tok_str[0] != '\0' && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
                     int tlen = (int)strlen(tok_str);
                     memcpy(gen_response + gen_resp_len, tok_str, tlen);
                     gen_resp_len += tlen;
                     gen_response[gen_resp_len] = 0;
                 }
-                if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
-                    fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
-                    break;
+                // Only send non-thinking, non-empty tokens via SSE
+                if (tok_str[0] != '\0' && !in_think) {
+                    if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
+                        fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
+                        break;
+                    }
                 }
                 gen_count++;
 
