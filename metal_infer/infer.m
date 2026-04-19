@@ -193,7 +193,8 @@ static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
 static int g_use_8bit = 0;       // enabled by --8bit flag: use 8-bit model weights + 8-bit kernel
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
-static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
+static int g_think_budget = 2048; // max thinking tokens before force-emitting </think_>
+static int g_no_think = 0;       // suppress thinking tokens entirely (--no-think or request param)
 
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [NUM_LAYERS] cold fds (set in main)
@@ -848,6 +849,13 @@ static int cpu_argmax(const float *x, int dim) {
         }
     }
     return best;
+}
+
+// Suppress thinking token in logits (set to -inf so argmax never picks it)
+static void suppress_think_token(float *logits) {
+    if (g_no_think) {
+        logits[THINK_START_TOKEN] = -1e30f;
+    }
 }
 
 // SiLU activation
@@ -5600,6 +5608,27 @@ static int extract_session_id(const char *buf, char *out_buf, int out_size) {
     return i > 0 ? 1 : 0;
 }
 
+// Extract "enable_thinking" or "no_think" from JSON body. Returns 1 if thinking should be disabled.
+static int extract_no_think(const char *buf) {
+    // Check for "enable_thinking": false
+    const char *p = strstr(buf, "\"enable_thinking\"");
+    if (p) {
+        p += 17; // skip "enable_thinking"
+        while (*p == ' ' || *p == '\t' || *p == ':' || *p == '\n' || *p == '\r') p++;
+        if (strncmp(p, "false", 5) == 0) return 1;
+        return 0;
+    }
+    // Check for "no_think": true
+    p = strstr(buf, "\"no_think\"");
+    if (p) {
+        p += 10; // skip "no_think"
+        while (*p == ' ' || *p == '\t' || *p == ':' || *p == '\n' || *p == '\r') p++;
+        if (strncmp(p, "true", 4) == 0) return 1;
+        return 0;
+    }
+    return 0;
+}
+
 // Write a full HTTP response string to fd
 static void http_write(int fd, const char *data, int len) {
     int sent = 0;
@@ -6012,12 +6041,17 @@ static void serve_loop(
             char req_session_id[64] = {0};
             int has_session = extract_session_id(body, req_session_id, sizeof(req_session_id));
 
+            // Per-request thinking control: override g_no_think if request specifies it
+            int saved_no_think = g_no_think;
+            if (extract_no_think(body)) g_no_think = 1;
+
             // Extract user content from messages (mutates body — must be last)
             char *content = extract_last_content(body);
             if (!content || strlen(content) == 0) {
                 http_write_str(client_fd,
                     "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
                     "{\"error\":\"no content in messages\"}\n");
+                g_no_think = saved_no_think;
                 free(reqbuf); close(client_fd); continue;
             }
             int is_continuation = (has_session &&
@@ -6047,6 +6081,7 @@ static void serve_loop(
                 http_write_str(client_fd,
                     "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
                     "{\"error\":\"tokenization failed\"}\n");
+                g_no_think = saved_no_think;
                 free(reqbuf); close(client_fd); continue;
             }
 
@@ -6184,6 +6219,7 @@ static void serve_loop(
                 free(normed);
             }
             lm_head_forward(wf, hidden, logits);
+            suppress_think_token(logits);
             int next_token = cpu_argmax(logits, VOCAB_SIZE);
 
             // ---- Auto-regressive generation with SSE streaming ----
@@ -6261,6 +6297,7 @@ static void serve_loop(
                     free(normed);
                 }
                 lm_head_forward(wf, hidden, logits);
+                suppress_think_token(logits);
                 next_token = cpu_argmax(logits, VOCAB_SIZE);
             }
 
@@ -6287,6 +6324,10 @@ static void serve_loop(
 
             free(pt->ids);
             free(pt);
+
+            // Restore per-request thinking override
+            g_no_think = saved_no_think;
+
             free(reqbuf);
             close(client_fd);
             continue;
@@ -6326,7 +6367,8 @@ static void print_usage(const char *prog) {
     printf("  --cache-telemetry    Report cold vs eviction misses and reuse distance\n");
     printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
-    printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
+    printf("  --think-budget N     Max thinking tokens before force </think_> (default: 2048, 0=unlimited)\n");
+    printf("  --no-think           Disable thinking mode entirely (suppress <think_> tokens)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
     printf("  --help               This message\n");
 }
@@ -6365,13 +6407,14 @@ int main(int argc, char **argv) {
             {"8bit",          no_argument,       0, '8'},
             {"gpu-linear",    no_argument,       0, 'G'},
             {"think-budget",  required_argument, 0, 'B'},
+            {"no-think",      no_argument,       0, 'N'},
             {"serve",         required_argument, 0, 'R'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2GNh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -6392,6 +6435,7 @@ int main(int argc, char **argv) {
                 case '8': g_use_8bit = 1; break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'B': g_think_budget = atoi(optarg); break;
+                case 'N': g_no_think = 1; break;
                 case 'R': serve_port = atoi(optarg); break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
@@ -6741,6 +6785,7 @@ int main(int argc, char **argv) {
 
 
         // ---- Sample first token ----
+        suppress_think_token(logits);
         int next_token = cpu_argmax(logits, VOCAB_SIZE);
         double ttft_ms = now_ms() - t0;
 
@@ -6819,6 +6864,7 @@ int main(int argc, char **argv) {
             lm_head_forward(wf, hidden, logits);
 
             // Greedy sample
+            suppress_think_token(logits);
             next_token = cpu_argmax(logits, VOCAB_SIZE);
 
             // Think budget: force end thinking if over budget
