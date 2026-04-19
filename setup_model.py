@@ -58,6 +58,16 @@ COMPONENTS_8BIT = [
     {"name": "down_proj.biases",  "offset": 3309568,   "size": 32768,   "shape": [2048, 8]},
 ]
 
+# MXFP8 E4M3 format: same total size as 8-bit but NO biases, larger scales (group_size=32)
+COMPONENTS_MXFP8 = [
+    {"name": "gate_proj.weight",  "offset": 0,         "size": 1048576, "shape": [512, 512]},
+    {"name": "gate_proj.scales",  "offset": 1048576,   "size": 65536,   "shape": [512, 64]},
+    {"name": "up_proj.weight",    "offset": 1114112,   "size": 1048576, "shape": [512, 512]},
+    {"name": "up_proj.scales",    "offset": 2162688,   "size": 65536,   "shape": [512, 64]},
+    {"name": "down_proj.weight",  "offset": 2228224,   "size": 1048576, "shape": [2048, 128]},
+    {"name": "down_proj.scales",  "offset": 3276800,   "size": 65536,   "shape": [2048, 16]},
+]
+
 EXPERT_SIZE_4BIT = 1769472
 EXPERT_SIZE_8BIT = 3342336
 EXPERT_SIZE = EXPERT_SIZE_4BIT  # default, overridden by --bits
@@ -293,7 +303,7 @@ def step3_generate_expert_index(model_path, output_dir):
     return out_path
 
 
-def step4_pack_experts(expert_index_path, output_dir):
+def step4_pack_experts(expert_index_path, output_dir, mxfp8=False):
     """Pack expert weights into per-layer binary files."""
     print(f"\n{'='*60}")
     print(f"Step 4: Pack experts into per-layer binaries")
@@ -304,7 +314,7 @@ def step4_pack_experts(expert_index_path, output_dir):
     expert_reads = idx['expert_reads']
     model_path = idx['model_path']
 
-    suffix = "_8bit" if EXPERT_SIZE == EXPERT_SIZE_8BIT else ""
+    suffix = "_mxfp8" if mxfp8 else ("_8bit" if EXPERT_SIZE == EXPERT_SIZE_8BIT else "")
     packed_dir = os.path.join(output_dir, f"packed_experts{suffix}")
     os.makedirs(packed_dir, exist_ok=True)
 
@@ -390,18 +400,26 @@ def main():
                         help='Run only a specific step (1-4)')
     parser.add_argument('--bits', type=int, default=4, choices=[4, 8],
                         help='Quantization bits (4 or 8)')
+    parser.add_argument('--mxfp8', action='store_true',
+                        help='Use MXFP8 E4M3 format (no biases, group_size=32)')
     args = parser.parse_args()
 
     # Select constants based on quantization
-    global COMPONENTS, EXPERT_SIZE, LAYER_SIZE
-    if args.bits == 8:
+    global COMPONENTS, EXPERT_SIZE, LAYER_SIZE, GROUP_SIZE
+    if args.mxfp8:
+        COMPONENTS = COMPONENTS_MXFP8
+        EXPERT_SIZE = EXPERT_SIZE_8BIT  # same size!
+        GROUP_SIZE = 32
+        print(f"Quantization: MXFP8 E4M3, group_size=32, no biases, expert size: {EXPERT_SIZE:,} bytes")
+    elif args.bits == 8:
         COMPONENTS = COMPONENTS_8BIT
         EXPERT_SIZE = EXPERT_SIZE_8BIT
     else:
         COMPONENTS = COMPONENTS_4BIT
         EXPERT_SIZE = EXPERT_SIZE_4BIT
     LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE
-    print(f"Quantization: {args.bits}-bit, expert size: {EXPERT_SIZE:,} bytes")
+    if not args.mxfp8:
+        print(f"Quantization: {args.bits}-bit, expert size: {EXPERT_SIZE:,} bytes")
 
     output_dir = args.output
     os.makedirs(output_dir, exist_ok=True)
@@ -431,7 +449,7 @@ def main():
         expert_index_path = step3_generate_expert_index(model_path, output_dir)
 
     if args.step is None or args.step == 4:
-        step4_pack_experts(expert_index_path, output_dir)
+        step4_pack_experts(expert_index_path, output_dir, mxfp8=args.mxfp8)
 
     print(f"\n{'='*60}")
     print("Setup complete! Run inference with:")
