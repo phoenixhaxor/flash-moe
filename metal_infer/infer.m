@@ -84,6 +84,35 @@
 #define GROUP_SIZE_8BIT      64
 #define GROUP_SIZE_MXFP8     32
 #define GROUP_SIZE           (g_use_mxfp8 ? GROUP_SIZE_MXFP8 : GROUP_SIZE_8BIT)
+
+// Expert layout offsets for 8-bit affine: uint32 weights + bf16 scales + bf16 biases
+// gate/up: W[512,512] uint32=1048576, S[512,32] bf16=32768, B[512,32] bf16=32768
+// down:    W[2048,128] uint32=1048576, S[2048,8] bf16=32768, B[2048,8] bf16=32768
+#define GATE_W_OFF_8  0
+#define GATE_S_OFF_8  1048576
+#define GATE_B_OFF_8  1081344
+#define UP_W_OFF_8    1114112
+#define UP_S_OFF_8    2162688
+#define UP_B_OFF_8    2195456
+#define DOWN_W_OFF_8  2228224
+#define DOWN_S_OFF_8  3276800
+#define DOWN_B_OFF_8  3309568
+#define EXPERT_SIZE_8BIT  3342336
+
+// Expert layout offsets for MXFP8: uint32 FP8-E4M3 weights + uint8 E8M0 scales, no biases
+// gate/up: W[512,512] uint32=1048576, S[512,64] uint8=32768
+// down:    W[2048,128] uint32=1048576, S[2048,16] uint8=32768
+#define GATE_W_OFF_MX  0
+#define GATE_S_OFF_MX  1048576
+#define UP_W_OFF_MX    1081344
+#define UP_S_OFF_MX    2129920
+#define DOWN_W_OFF_MX  2162688
+#define DOWN_S_OFF_MX  3211264
+#define EXPERT_SIZE_MXFP8  3244032
+// MXFP8 has no biases — these dummies satisfy EXPERT_OFF(GATE_B) etc.
+#define GATE_B_OFF_MX   0
+#define UP_B_OFF_MX     0
+#define DOWN_B_OFF_MX   0
 #define BITS                4
 
 // Linear attention (GatedDeltaNet) constants
@@ -227,22 +256,22 @@ static inline int expert_pick_fd(int layer, int expert, int warm_fd) {
 }
 
 // Expert offset helper: selects 2-bit, 8-bit, or 4-bit offset
-#define EXPERT_OFF(name) (g_use_2bit ? name##_OFF_2 : (g_use_8bit || g_use_mxfp8 ? name##_OFF_8 : name##_OFF_4))
+#define EXPERT_OFF(name) (g_use_2bit ? name##_OFF_2 : (g_use_mxfp8 ? name##_OFF_MX : (g_use_8bit ? name##_OFF_8 : name##_OFF_4)))
 
 // Expert size/offset constants untuk mxfp8 (IDENTIK dengan 8-bit!)
 // Active expert size based on quantization mode
 static inline size_t active_expert_size(void) {
-    return g_use_2bit ? EXPERT_SIZE_2BIT : ((g_use_8bit || g_use_mxfp8) ? EXPERT_SIZE_8BIT : EXPERT_SIZE);
+    return g_use_2bit ? EXPERT_SIZE_2BIT : (g_use_mxfp8 ? EXPERT_SIZE_MXFP8 : (g_use_8bit ? EXPERT_SIZE_8BIT : EXPERT_SIZE));
 }
 
 // Dispatch dequant matvec: picks mxfp8 or affine path based on flags
-static inline void dispatch_dequant_matvec(
+// NOTE: for mxfp8, scales are actually uint8 (E8M0) stored in packed experts
+static void dispatch_dequant_matvec(
     const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
-    const float *x, float *out,
-    int out_dim, int in_dim, int group_size
+    const float *x, float *out, int out_dim, int in_dim, int group_size
 ) {
     if (g_use_mxfp8) {
-        cpu_dequant_matvec_mxfp8(W, scales, x, out, out_dim, in_dim, group_size);
+        cpu_dequant_matvec_mxfp8(W, (const uint16_t*)scales, x, out, out_dim, in_dim, group_size);
     } else {
         cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
     }
@@ -579,10 +608,32 @@ static WeightFile *open_weights(const char *bin_path, const char *json_path) {
 static void *get_tensor_ptr(WeightFile *wf, const char *name) {
     TensorInfo *t = find_tensor(wf->manifest, name);
     if (!t) {
-        fprintf(stderr, "WARNING: tensor '%s' not found\n", name);
+        // MXFP8 models have no biases on most projections — suppress noise
+        if (!(g_use_mxfp8 && strstr(name, ".biases"))) {
+            fprintf(stderr, "WARNING: tensor '%s' not found\n", name);
+        }
         return NULL;
     }
     return (char *)wf->data + t->offset;
+}
+
+// Get bias pointer — returns dummy zero buffer for MXFP8 models (no biases)
+// The dummy buffer is allocated once and contains all zeros.
+static uint16_t *g_mxfp8_zero_biases = NULL;
+static size_t g_mxfp8_zero_biases_size = 0;
+
+static uint16_t *get_biases_ptr(WeightFile *wf, const char *name, size_t min_count) {
+    uint16_t *ptr = (uint16_t *)get_tensor_ptr(wf, name);
+    if (ptr) return ptr;
+    if (!g_use_mxfp8) return NULL;
+    // Allocate or grow zero buffer for MXFP8
+    size_t needed = min_count * sizeof(uint16_t);
+    if (needed > g_mxfp8_zero_biases_size) {
+        g_mxfp8_zero_biases = realloc(g_mxfp8_zero_biases, needed);
+        memset(g_mxfp8_zero_biases, 0, needed);
+        g_mxfp8_zero_biases_size = needed;
+    }
+    return g_mxfp8_zero_biases;
 }
 
 static TensorInfo *get_tensor_info(WeightFile *wf, const char *name) {
@@ -763,8 +814,6 @@ static void cpu_dequant_matvec(
 // FP8 E4M3 to FP32 conversion for MXFP8 format
 // ============================================================================
 // E4M3: 1 sign + 4 exponent (bias=7) + 3 mantissa
-// Range: ±[2^-6 * 0.125, 2^9 * 1.875] = ±[0.001953125, 960]
-// No infinity — only NaN (exp=15, mantissa=7)
 static inline float e4m3_to_f32(uint8_t v) {
     uint32_t sign = (v >> 7) & 1;
     uint32_t exponent = (v >> 3) & 0xF;
@@ -782,27 +831,37 @@ static inline float e4m3_to_f32(uint8_t v) {
     int fp32_exp = (int)exponent - 7 + 127;
     uint32_t bits;
     if (exponent == 0) {
-        // Subnormal: no implicit 1, adjust exponent
-        fp32_exp = 120; // 127 - 7
+        fp32_exp = 120;
         bits = (sign << 31) | (fp32_exp << 23) | (mantissa << 20);
-        // Compensate for missing implicit bit and correct range
         float r; memcpy(&r, &bits, 4);
-        return r * 0.5f;  // subnormal adjustment
+        return r * 0.5f;
     }
     bits = (sign << 31) | ((uint32_t)fp32_exp << 23) | (mantissa << 20);
     float r; memcpy(&r, &bits, 4);
     return r;
 }
 
+// E8M0 to FP32: pure power-of-2 scale (sign + 7-bit exponent)
+// value = (-1)^sign * 2^(exp7 - 127)
+static inline float e8m0_to_f32(uint8_t b) {
+    if (b == 0xFF) return NAN;
+    uint32_t sign = (b >> 7) & 1;
+    uint32_t exp7 = b & 0x7F;
+    uint32_t bits = (sign << 31) | (exp7 << 23);
+    float r; memcpy(&r, &bits, 4);
+    return r;
+}
+
 // MXFP8 dequant matvec: out[out_dim] = W * x[in_dim]
-// Weights are FP8 E4M3 packed 4-per-uint32, scales only (no biases), group_size=32
+// Weights are FP8 E4M3 packed 4-per-uint32
+// Scales are E8M0 (uint8 stored as uint16) per group of 32
 static void cpu_dequant_matvec_mxfp8(
     const uint32_t *W, const uint16_t *scales,
     const float *x, float *out,
     int out_dim, int in_dim, int group_size
 ) {
     int num_groups = in_dim / group_size;
-    int packed_cols = in_dim / 4;  // 4 FP8 values per uint32
+    int packed_cols = in_dim / 4;
     int packed_per_group = group_size / 4;
     
     for (int row = 0; row < out_dim; row++) {
@@ -811,7 +870,8 @@ static void cpu_dequant_matvec_mxfp8(
         const uint16_t *s_row = scales + row * num_groups;
         
         for (int g = 0; g < num_groups; g++) {
-            float scale = bf16_to_f32(s_row[g]);
+            // E8M0 scale: uint16 → low byte = E8M0 scale factor
+            float scale = e8m0_to_f32((uint8_t)(s_row[g] & 0xFF));
             int base_packed = g * packed_per_group;
             int base_x = g * group_size;
             
@@ -819,7 +879,6 @@ static void cpu_dequant_matvec_mxfp8(
                 uint32_t packed = w_row[base_packed + p];
                 int x_base = base_x + p * 4;
                 
-                // Extract 4 FP8 E4M3 values, convert, multiply by scale (no bias!)
                 acc += e4m3_to_f32((packed >>  0) & 0xFF) * scale * x[x_base + 0];
                 acc += e4m3_to_f32((packed >>  8) & 0xFF) * scale * x[x_base + 1];
                 acc += e4m3_to_f32((packed >> 16) & 0xFF) * scale * x[x_base + 2];
@@ -2597,28 +2656,28 @@ static void linear_attention_forward(
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.scales", layer_idx);
     uint16_t *qkv_s = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.biases", layer_idx);
-    uint16_t *qkv_b = get_tensor_ptr(wf, name);
+    uint16_t *qkv_b = get_biases_ptr(wf, name, 32768);
 
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.weight", layer_idx);
     uint32_t *z_w = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.scales", layer_idx);
     uint16_t *z_s = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.biases", layer_idx);
-    uint16_t *z_b = get_tensor_ptr(wf, name);
+    uint16_t *z_b = get_biases_ptr(wf, name, 32768);
 
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.weight", layer_idx);
     uint32_t *b_w = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.scales", layer_idx);
     uint16_t *b_s = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.biases", layer_idx);
-    uint16_t *b_b = get_tensor_ptr(wf, name);
+    uint16_t *b_b = get_biases_ptr(wf, name, 32768);
 
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.weight", layer_idx);
     uint32_t *a_w = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.scales", layer_idx);
     uint16_t *a_s = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.biases", layer_idx);
-    uint16_t *a_b = get_tensor_ptr(wf, name);
+    uint16_t *a_b = get_biases_ptr(wf, name, 32768);
 
     if (qkv_w && qkv_s && qkv_b && z_w && z_s && z_b &&
         b_w && b_s && b_b && a_w && a_s && a_b) {
@@ -2779,7 +2838,7 @@ static void linear_attention_forward(
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.scales", layer_idx);
     uint16_t *out_s = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.biases", layer_idx);
-    uint16_t *out_b = get_tensor_ptr(wf, name);
+    uint16_t *out_b = get_biases_ptr(wf, name, 32768);
     if (out_w && out_s && out_b) {
         fast_dequant_matvec(out_w, out_s, out_b, gated_out, attn_out, HIDDEN_DIM,
                             LINEAR_TOTAL_VALUE, GROUP_SIZE);
@@ -2849,7 +2908,7 @@ static void moe_forward(
     snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.scales", layer_idx);
     uint16_t *gate_s = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.biases", layer_idx);
-    uint16_t *gate_b = get_tensor_ptr(wf, name);
+    uint16_t *gate_b = get_biases_ptr(wf, name, 32768);
 
     snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", layer_idx);
     uint32_t *sgw = get_tensor_ptr(wf, name);
@@ -2870,7 +2929,7 @@ static void moe_forward(
     snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.scales", layer_idx);
     uint16_t *seg_s = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.biases", layer_idx);
-    uint16_t *seg_b = get_tensor_ptr(wf, name);
+    uint16_t *seg_b = get_biases_ptr(wf, name, 32768);
 
     // All 4 matmuls share h_post as input -- batch into one command buffer
     if (gate_w && gate_s && gate_b && sgw && sgs && sgb &&
@@ -3038,51 +3097,65 @@ static void moe_forward(
 // ============================================================================
 
 static void embed_lookup(WeightFile *wf, int token_id, float *out) {
-    // Embedding: weight[vocab_size, hidden_dim/8] (U32), scales[vocab_size, groups], biases[vocab_size, groups]
-    // For embedding lookup, we just need one row.
-    // But the embedding is quantized: each row has hidden_dim/8 uint32 values (packed 4-bit)
-    // plus scales and biases per group
+    // Embedding: weight[vocab_size, hidden_dim/vals_per_u32] (U32), scales[vocab_size, groups]
+    // Biases optional (MXFP8 has no biases)
 
     TensorInfo *w_info = get_tensor_info(wf, "model.embed_tokens.weight");
     TensorInfo *s_info = get_tensor_info(wf, "model.embed_tokens.scales");
     TensorInfo *b_info = get_tensor_info(wf, "model.embed_tokens.biases");
 
-    if (!w_info || !s_info || !b_info) {
+    if (!w_info || !s_info) {
         fprintf(stderr, "ERROR: embedding tensors not found\n");
         memset(out, 0, HIDDEN_DIM * sizeof(float));
         return;
     }
 
-    // w shape: [248320, 512] U32 -> each row has 512 uint32 = 4096 packed 4-bit values
-    int packed_cols = w_info->shape[1];  // 512
-    int num_groups = s_info->shape[1];   // 64
+    int packed_cols = w_info->shape[1];
+    int num_groups = s_info->shape[1];
 
     uint32_t *W = (uint32_t *)((char *)wf->data + w_info->offset);
     uint16_t *S = (uint16_t *)((char *)wf->data + s_info->offset);
-    uint16_t *B = (uint16_t *)((char *)wf->data + b_info->offset);
+    uint16_t *B = b_info ? (uint16_t *)((char *)wf->data + b_info->offset) : NULL;
 
     const uint32_t *w_row = W + (size_t)token_id * packed_cols;
     const uint16_t *s_row = S + (size_t)token_id * num_groups;
-    const uint16_t *b_row = B + (size_t)token_id * num_groups;
+    const uint16_t *b_row = B ? (B + (size_t)token_id * num_groups) : NULL;
 
-    int group_size = HIDDEN_DIM / num_groups;  // 2048/32 = 64
-    // Bit-width aware: 4-bit = 8 vals/u32, 8-bit = 4 vals/u32
-    int vals_per_u32 = g_use_8bit ? 4 : 8;
-    int bits = g_use_8bit ? 8 : 4;
-    uint32_t mask = (1u << bits) - 1;
-    int packed_per_group = group_size / vals_per_u32;
+    int group_size = HIDDEN_DIM / num_groups;
 
-    for (int g = 0; g < num_groups; g++) {
-        float scale = bf16_to_f32(s_row[g]);
-        float bias = bf16_to_f32(b_row[g]);
+    if (g_use_mxfp8) {
+        // MXFP8: FP8 E4M3 weights, E8M0 scales (uint8 in uint16), no bias
+        int vals_per_u32 = 4;
+        int packed_per_group = group_size / vals_per_u32;
+        for (int g = 0; g < num_groups; g++) {
+            float scale = e8m0_to_f32((uint8_t)(s_row[g] & 0xFF));
+            for (int p = 0; p < packed_per_group; p++) {
+                uint32_t packed = w_row[g * packed_per_group + p];
+                int base = g * group_size + p * vals_per_u32;
+                for (int n = 0; n < vals_per_u32; n++) {
+                    out[base + n] = e4m3_to_f32((packed >> (n * 8)) & 0xFF) * scale;
+                }
+            }
+        }
+    } else {
+        // Affine quantization (4-bit or 8-bit)
+        int vals_per_u32 = g_use_8bit ? 4 : 8;
+        int bits = g_use_8bit ? 8 : 4;
+        uint32_t mask = (1u << bits) - 1;
+        int packed_per_group = group_size / vals_per_u32;
 
-        for (int p = 0; p < packed_per_group; p++) {
-            uint32_t packed = w_row[g * packed_per_group + p];
-            int base = g * group_size + p * vals_per_u32;
+        for (int g = 0; g < num_groups; g++) {
+            float scale = bf16_to_f32(s_row[g]);
+            float bias = b_row ? bf16_to_f32(b_row[g]) : 0.0f;
 
-            for (int n = 0; n < vals_per_u32; n++) {
-                uint32_t val = (packed >> (n * bits)) & mask;
-                out[base + n] = (float)val * scale + bias;
+            for (int p = 0; p < packed_per_group; p++) {
+                uint32_t packed = w_row[g * packed_per_group + p];
+                int base = g * group_size + p * vals_per_u32;
+
+                for (int n = 0; n < vals_per_u32; n++) {
+                    uint32_t val = (packed >> (n * bits)) & mask;
+                    out[base + n] = (float)val * scale + bias;
+                }
             }
         }
     }
@@ -3093,25 +3166,28 @@ static void embed_lookup(WeightFile *wf, int token_id, float *out) {
 // ============================================================================
 
 static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) {
-    // lm_head: [hidden_dim=4096] -> [vocab_size=248320]
-    // This is a HUGE matmul. For 248320 output dims, it will be slow on CPU.
-    // Optimization: only compute top candidates
+    // lm_head: [hidden_dim] -> [vocab_size=248320]
+    // Biases optional (MXFP8 has no biases)
 
     TensorInfo *w_info = get_tensor_info(wf, "lm_head.weight");
     TensorInfo *s_info = get_tensor_info(wf, "lm_head.scales");
     TensorInfo *b_info = get_tensor_info(wf, "lm_head.biases");
 
-    if (!w_info || !s_info || !b_info) {
+    if (!w_info || !s_info) {
         fprintf(stderr, "ERROR: lm_head tensors not found\n");
         return;
     }
 
     uint32_t *W = (uint32_t *)((char *)wf->data + w_info->offset);
     uint16_t *S = (uint16_t *)((char *)wf->data + s_info->offset);
-    uint16_t *B = (uint16_t *)((char *)wf->data + b_info->offset);
+    uint16_t *B = b_info ? (uint16_t *)((char *)wf->data + b_info->offset) : g_mxfp8_zero_biases;
 
-    // Full matmul — use GPU if available (248320 output rows!)
-    fast_dequant_matvec(W, S, B, hidden, logits, VOCAB_SIZE, HIDDEN_DIM, GROUP_SIZE);
+    if (g_use_mxfp8) {
+        // MXFP8: use mxfp8 dequant path for lm_head
+        cpu_dequant_matvec_mxfp8(W, S, hidden, logits, VOCAB_SIZE, HIDDEN_DIM, GROUP_SIZE);
+    } else {
+        fast_dequant_matvec(W, S, B, hidden, logits, VOCAB_SIZE, HIDDEN_DIM, GROUP_SIZE);
+    }
 }
 
 // ============================================================================
@@ -3805,25 +3881,25 @@ static void build_layer_cache(WeightFile *wf) {
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.scales", i);
             lc->q_s = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.biases", i);
-            lc->q_b = get_tensor_ptr(wf, name);
+            lc->q_b = get_biases_ptr(wf, name, 32768);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", i);
             lc->k_w = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.scales", i);
             lc->k_s = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.biases", i);
-            lc->k_b = get_tensor_ptr(wf, name);
+            lc->k_b = get_biases_ptr(wf, name, 32768);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", i);
             lc->v_w = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.scales", i);
             lc->v_s = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.biases", i);
-            lc->v_b = get_tensor_ptr(wf, name);
+            lc->v_b = get_biases_ptr(wf, name, 32768);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", i);
             lc->o_w = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.scales", i);
             lc->o_s = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.biases", i);
-            lc->o_b = get_tensor_ptr(wf, name);
+            lc->o_b = get_biases_ptr(wf, name, 32768);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", i);
             lc->q_norm_w = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", i);
@@ -3835,25 +3911,25 @@ static void build_layer_cache(WeightFile *wf) {
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.scales", i);
             lc->qkv_s = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.biases", i);
-            lc->qkv_b = get_tensor_ptr(wf, name);
+            lc->qkv_b = get_biases_ptr(wf, name, 32768);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.weight", i);
             lc->z_w = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.scales", i);
             lc->z_s = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.biases", i);
-            lc->z_b = get_tensor_ptr(wf, name);
+            lc->z_b = get_biases_ptr(wf, name, 32768);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.weight", i);
             lc->b_w = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.scales", i);
             lc->b_s = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.biases", i);
-            lc->b_b = get_tensor_ptr(wf, name);
+            lc->b_b = get_biases_ptr(wf, name, 32768);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.weight", i);
             lc->a_w = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.scales", i);
             lc->a_s = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.biases", i);
-            lc->a_b = get_tensor_ptr(wf, name);
+            lc->a_b = get_biases_ptr(wf, name, 32768);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.conv1d.weight", i);
             lc->conv1d_w = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.A_log", i);
@@ -3867,7 +3943,7 @@ static void build_layer_cache(WeightFile *wf) {
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.scales", i);
             lc->out_proj_s = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.biases", i);
-            lc->out_proj_b = get_tensor_ptr(wf, name);
+            lc->out_proj_b = get_biases_ptr(wf, name, 32768);
         }
 
         // MoE weights (same for all layers)
@@ -3876,31 +3952,31 @@ static void build_layer_cache(WeightFile *wf) {
         snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.scales", i);
         lc->gate_s = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.biases", i);
-        lc->gate_b = get_tensor_ptr(wf, name);
+        lc->gate_b = get_biases_ptr(wf, name, 32768);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", i);
         lc->sg_w = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.scales", i);
         lc->sg_s = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.biases", i);
-        lc->sg_b = get_tensor_ptr(wf, name);
+        lc->sg_b = get_biases_ptr(wf, name, 32768);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.weight", i);
         lc->su_w = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.scales", i);
         lc->su_s = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.biases", i);
-        lc->su_b = get_tensor_ptr(wf, name);
+        lc->su_b = get_biases_ptr(wf, name, 32768);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", i);
         lc->sd_w = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.scales", i);
         lc->sd_s = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.biases", i);
-        lc->sd_b = get_tensor_ptr(wf, name);
+        lc->sd_b = get_biases_ptr(wf, name, 32768);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.weight", i);
         lc->seg_w = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.scales", i);
         lc->seg_s = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.biases", i);
-        lc->seg_b = get_tensor_ptr(wf, name);
+        lc->seg_b = get_biases_ptr(wf, name, 32768);
     }
 
     layer_cache_built = 1;

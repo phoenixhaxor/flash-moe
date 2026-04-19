@@ -1,18 +1,17 @@
 /*
- * shaders_mxfp8.metal — Metal compute shader for MXFP8 (E4M3) quantized matvec
+ * shaders_mxfp8.metal — Metal compute shader for MXFP8 (E4M3 weight + E8M0 scale)
  *
- * MXFP8 format:
- *   - Each weight is 1 byte = FP8 E4M3 (1 sign + 4 exponent + 3 mantissa)
+ * MXFP8 format (Microscaling):
+ *   - Each weight is FP8 E4M3 (1 sign + 4 exponent + 3 mantissa) stored as uint8
  *   - 4 values packed per uint32
- *   - Per-group scale in bfloat16 (NO bias needed — floating point quantization)
- *   - group_size = 32 for expert weights
+ *   - Per-group scale is E8M0 (1 sign + 7 exponent, pure power of 2) stored as uint8
+ *   - group_size = 32 for all weights
  *
  * Dequantization:
- *   value_fp32 = e4m3_to_fp32(uint8_value) * group_scale
+ *   value_fp32 = e4m3_to_fp32(weight_byte) * e8m0_to_fp32(scale_byte)
  *
- * vs Affine uint8 (current):
- *   value_fp32 = uint8_value * scale + bias   (2 ops)
- *   value_fp32 = fp8_value * scale             (1 op + lookup)
+ * E8M0 format: sign(1) + exponent(7), value = (-1)^sign * 2^(exp - 127)
+ *   Special: 0xFF = NaN, 0x7F = 1.0
  *
  * Author: Phoenix (for Tuan Andre / Panglima Ekspres)
  */
@@ -23,84 +22,67 @@ using namespace metal;
 // ============================================================================
 // FP8 E4M3 to FP32 conversion
 // ============================================================================
-// E4M3 format: 1 sign bit, 4 exponent bits (bias=7), 3 mantissa bits
-// Special cases: exponent=0b1111 with mantissa=0b111 = NaN (rest are normal)
-// Range: ±[2^-6 * 1.0,  2^9 * 1.875] = ±[0.015625, 960]
-// Note: no infinity in E4M3 (unlike E5M2)
-
 static inline float e4m3_to_f32(uint8_t v) {
-    // Extract components
     uint sign     = (v >> 7) & 1;
     uint exponent = (v >> 3) & 0xF;
     uint mantissa = v & 0x7;
 
-    if (exponent == 0 && mantissa == 0) {
-        return 0.0f; // zero
-    }
+    if (exponent == 0 && mantissa == 0) return 0.0f;
 
-    // E4M3 exponent bias = 7
-    // FP32 exponent bias = 127
-    // FP32 exp = e4m3_exp - 7 + 127 = e4m3_exp + 120
-    int fp32_exp = (int)exponent - 7 + 127;
+    // NaN: exp=15, mantissa=7
+    if (exponent == 15 && mantissa == 7) {
+        return sign ? as_type<float>(0xFFC00000u) : as_type<float>(0x7FC00000u);
+    }
 
     if (exponent == 0) {
-        // Subnormal E4M3: value = (-1)^sign * 2^-6 * (mantissa/8)
-        fp32_exp = 127 - 7; // = 120
-        // mantissa is already < 8, so no implicit 1
-        float val = (float)mantissa / 8.0f;
-        // Adjust for subnormal: multiply by 2^(-6) relative to exp=1 case
-        // exp=0 → actual exponent = 1-7 = -6, but without implicit 1
-        val *= 0.5f; // compensate for missing implicit bit
-        uint32_t bits = (sign << 31) | ((uint32_t)fp32_exp << 23) | ((uint32_t)(val * (1 << 23)) & 0x7FFFFF);
-        float result;
-        memcpy(&result, &bits, 4);
-        return result;
+        // Subnormal E4M3
+        uint32_t bits = (sign << 31) | (120u << 23) | (mantissa << 20);
+        return as_type<float>(bits) * 0.5f;
     }
 
-    // Normal: value = (-1)^sign * 2^(exp-7) * (1 + mantissa/8)
-    // FP32: sign(1) | exponent(8) | mantissa(23)
-    // mantissa in FP32 = E4M3 mantissa << 20 (3 bits → 23 bits)
+    // Normal
+    int fp32_exp = (int)exponent - 7 + 127;
     uint32_t bits = (sign << 31) | ((uint32_t)fp32_exp << 23) | (mantissa << 20);
-
-    // Handle NaN: E4M3 NaN when exponent=15 and mantissa=7
-    if (exponent == 15 && mantissa == 7) {
-        bits = 0x7FC00000; // FP32 NaN
-        if (sign) bits |= (1u << 31);
-    }
-
-    float result;
-    memcpy(&result, &bits, 4);
-    return result;
-}
-
-// BF16 to FP32 conversion (reuse from main shaders)
-static inline float bf16_to_f32_mxfp(uint16_t h) {
-    uint32_t bits = ((uint32_t)h) << 16;
-    float result;
-    memcpy(&result, &bits, 4);
-    return result;
+    return as_type<float>(bits);
 }
 
 // ============================================================================
-// Kernel: MXFP8 dequant matvec
+// E8M0 to FP32 conversion (pure power-of-2 scale factor)
 // ============================================================================
-// Same buffer interface as dequant_matvec_8bit (buffers 0-7) so infer.m doesn't need changes.
-// Buffer 2 (biases) is accepted but IGNORED — MXFP8 has no biases.
+// E8M0: sign(1) + exponent(7), no mantissa
+// value = (-1)^sign * 2^(exp - 127)
+// Special: 0xFF = NaN
+static inline float e8m0_to_f32(uint8_t b) {
+    if (b == 0xFF) return as_type<float>(0x7FC00000u); // NaN
+
+    uint sign = (b >> 7) & 1;
+    uint exp7 = b & 0x7F;
+
+    // Build FP32: 2^(exp7 - 127)
+    // FP32 bias = 127, so FP32 exponent = exp7
+    uint32_t bits = (sign << 31) | (exp7 << 23);
+    return as_type<float>(bits);
+}
+
+// ============================================================================
+// Kernel: MXFP8 dequant matvec (E4M3 weight + E8M0 scale)
+// ============================================================================
+// Same buffer interface as dequant_matvec_8bit (buffers 0-7).
+// Buffer 2 (biases) accepted but IGNORED — MXFP8 has no biases.
 //
-// Layout:
-//   W_packed: [out_dim, in_dim/4] uint32 (4 x FP8 per uint32)
-//   scales:   [out_dim, in_dim/group_size] bfloat16
-//   x:        [in_dim] float32
-//   out:      [out_dim] float32
+// Weight layout: [out_dim, in_dim/4] uint32 (4 x FP8 E4M3 per uint32)
+// Scale layout:  [out_dim, in_dim/group_size] uint8 stored as uint16 (padded)
+//   NOTE: scales are E8M0 (uint8) but packed in the model_weights.bin as uint16 pairs
+//         We read them as uint16 but only use the low byte
 
 constant uint ROWS_PER_TG_MX = 4;
 
 kernel void dequant_matvec_mxfp8(
-    device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/4]
-    device const uint16_t* scales     [[buffer(1)]],  // [out_dim, num_groups] bf16
-    device const uint16_t* biases     [[buffer(2)]],  // UNUSED — MXFP8 has no biases
-    device const float*    x          [[buffer(3)]],  // [in_dim]
-    device float*          out        [[buffer(4)]],  // [out_dim]
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint8_t*  scales     [[buffer(1)]],  // E8M0 scales (uint8, NOT uint16!)
+    device const uint16_t* biases     [[buffer(2)]],  // UNUSED
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
     constant uint&         out_dim    [[buffer(5)]],
     constant uint&         in_dim     [[buffer(6)]],
     constant uint&         group_size [[buffer(7)]],
@@ -110,7 +92,7 @@ kernel void dequant_matvec_mxfp8(
     uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
     uint row = tgid * ROWS_PER_TG_MX + simd_group;
-    uint packed_cols = in_dim / 4;      // 4 x FP8 values per uint32
+    uint packed_cols = in_dim / 4;
     uint num_groups  = in_dim / group_size;
 
     threadgroup float x_shared[4096];
@@ -122,26 +104,24 @@ kernel void dequant_matvec_mxfp8(
     if (row >= out_dim) return;
 
     device const uint32_t* w_row = W_packed + row * packed_cols;
-    device const uint16_t* s_row = scales + row * num_groups;
-    (void)biases;  // suppress unused warning
+    device const uint8_t*  s_row = scales + row * num_groups;
+    (void)biases;
 
     float acc = 0.0f;
 
     for (uint col = simd_lane; col < packed_cols; col += 32) {
-        // Which group does this packed column belong to?
         uint g = col / (group_size / 4);
-        float scale = bf16_to_f32_mxfp(s_row[g]);
+        float scale = e8m0_to_f32(s_row[g]);
 
         uint32_t packed = w_row[col];
         uint x_base = col * 4;
 
-        // Extract 4 FP8 values and dequantize
         float x0 = x_shared[x_base + 0];
         float x1 = x_shared[x_base + 1];
         float x2 = x_shared[x_base + 2];
         float x3 = x_shared[x_base + 3];
 
-        // E4M3 dequant: just convert to float and multiply by scale (no bias!)
+        // E4M3 dequant: convert byte to float, multiply by E8M0 scale
         acc += e4m3_to_f32((packed >>  0) & 0xFF) * scale * x0;
         acc += e4m3_to_f32((packed >>  8) & 0xFF) * scale * x1;
         acc += e4m3_to_f32((packed >> 16) & 0xFF) * scale * x2;

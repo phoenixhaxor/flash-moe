@@ -60,16 +60,19 @@ COMPONENTS_8BIT = [
 
 # MXFP8 E4M3 format: same total size as 8-bit but NO biases, larger scales (group_size=32)
 COMPONENTS_MXFP8 = [
+    # MXFP8: uint32 FP8-E4M3 weights + uint8 E8M0 scales, no biases, group_size=32
+    # Per component: weight = rows * (in_dim/4) * 4 bytes, scales = rows * (in_dim/32) * 1 byte
     {"name": "gate_proj.weight",  "offset": 0,         "size": 1048576, "shape": [512, 512]},
-    {"name": "gate_proj.scales",  "offset": 1048576,   "size": 65536,   "shape": [512, 64]},
-    {"name": "up_proj.weight",    "offset": 1114112,   "size": 1048576, "shape": [512, 512]},
-    {"name": "up_proj.scales",    "offset": 2162688,   "size": 65536,   "shape": [512, 64]},
-    {"name": "down_proj.weight",  "offset": 2228224,   "size": 1048576, "shape": [2048, 128]},
-    {"name": "down_proj.scales",  "offset": 3276800,   "size": 65536,   "shape": [2048, 16]},
+    {"name": "gate_proj.scales",  "offset": 1048576,   "size": 32768,   "shape": [512, 64]},
+    {"name": "up_proj.weight",    "offset": 1081344,   "size": 1048576, "shape": [512, 512]},
+    {"name": "up_proj.scales",    "offset": 2129920,   "size": 32768,   "shape": [512, 64]},
+    {"name": "down_proj.weight",  "offset": 2162688,   "size": 1048576, "shape": [2048, 128]},
+    {"name": "down_proj.scales",  "offset": 3211264,   "size": 32768,   "shape": [2048, 16]},
 ]
 
 EXPERT_SIZE_4BIT = 1769472
 EXPERT_SIZE_8BIT = 3342336
+EXPERT_SIZE_MXFP8 = 3244032
 EXPERT_SIZE = EXPERT_SIZE_4BIT  # default, overridden by --bits
 COMPONENTS = COMPONENTS_4BIT     # default
 LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE
@@ -408,9 +411,9 @@ def main():
     global COMPONENTS, EXPERT_SIZE, LAYER_SIZE, GROUP_SIZE
     if args.mxfp8:
         COMPONENTS = COMPONENTS_MXFP8
-        EXPERT_SIZE = EXPERT_SIZE_8BIT  # same size!
+        EXPERT_SIZE = EXPERT_SIZE_MXFP8
         GROUP_SIZE = 32
-        print(f"Quantization: MXFP8 E4M3, group_size=32, no biases, expert size: {EXPERT_SIZE:,} bytes")
+        print(f"Quantization: MXFP8 E4M3+E8M0, group_size=32, no biases, expert size: {EXPERT_SIZE:,} bytes")
     elif args.bits == 8:
         COMPONENTS = COMPONENTS_8BIT
         EXPERT_SIZE = EXPERT_SIZE_8BIT
