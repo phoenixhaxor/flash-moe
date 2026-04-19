@@ -6265,7 +6265,7 @@ static char *load_system_prompt(void) {
             return buf;
         }
     }
-    return strdup("You are a helpful assistant.");
+    return strdup("You are a helpful assistant. /no_think");
 }
 
 // Tokenize a full chat message (system prompt + user turn) for first-time use.
