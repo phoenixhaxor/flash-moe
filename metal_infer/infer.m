@@ -6885,15 +6885,22 @@ static void serve_loop(
             char *gen_response = calloc(1, 256 * 1024);
             int gen_resp_len = 0;
 
-            // ---- Speculative decoding path (Phase 1: self-speculative) ----
+            // ---- Speculative decoding path (Phase 2: snapshot + rollback) ----
             // When g_speculative > 0, we generate N "draft" tokens with the target
-            // model (greedy), then verify them in a batched forward pass.
-            // Since the draft == target model, all tokens should be accepted,
-            // but this tests the infrastructure for future draft model integration.
+            // model (greedy), snapshot state before verify, run batched verify,
+            // and rollback on partial rejection.
+            // Phase 2 adds: KV cache + GDN state snapshots, partial acceptance + rollback.
             if (g_speculative > 0 && g_speculative <= VERIFY_MAX_TOKENS) {
                 int spec_N = g_speculative;
                 float *verify_logits = calloc((size_t)spec_N * VOCAB_SIZE, sizeof(float));
                 int *draft_tokens = calloc(spec_N, sizeof(int));
+
+                // Pre-allocate GDN state snapshot buffers (reused each iteration)
+                size_t conv_state_size = (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM * sizeof(float);
+                size_t ssm_state_size = LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float);
+                float *snap_conv = malloc(conv_state_size * NUM_LAYERS);   // flat buffer for all layers
+                float *snap_ssm  = malloc(ssm_state_size * NUM_LAYERS);    // flat buffer for all layers
+                int snap_kv_lens[NUM_LAYERS];  // KV cache lengths before draft
 
                 fprintf(stderr, "[speculative] enabled, batch_size=%d\n", spec_N);
 
@@ -6941,7 +6948,24 @@ static void serve_loop(
                     }
                     gen_count++;
 
-                    // Generate N-1 draft tokens with the target model (greedy)
+                    // ---- Snapshot state before draft generation ----
+                    // Save KV cache lengths (for truncation on rejection)
+                    for (int i = 0; i < NUM_LAYERS; i++) {
+                        snap_kv_lens[i] = kv_caches[i] ? kv_caches[i]->len : 0;
+                    }
+                    // Save GDN linear attention states (conv + ssm) for all layers
+                    for (int i = 0; i < NUM_LAYERS; i++) {
+                        if (layer_states[i]) {
+                            LinearAttnState *s = (LinearAttnState *)layer_states[i];
+                            memcpy(snap_conv + (size_t)i * (conv_state_size / sizeof(float)),
+                                   s->conv_state, conv_state_size);
+                            memcpy(snap_ssm + (size_t)i * (ssm_state_size / sizeof(float)),
+                                   s->ssm_state, ssm_state_size);
+                        }
+                    }
+                    int snap_pos = pos;
+
+                    // Generate N draft tokens with the target model (greedy)
                     // + 1 bonus token (the one after the last draft)
                     int n_draft = 0;
                     int draft_pos = pos;
@@ -6982,7 +7006,6 @@ static void serve_loop(
                         if (in_think) {
                             think_tokens++;
                             if (g_think_budget > 0 && think_tokens >= g_think_budget) {
-                                // Override: we'll handle this on next outer iteration
                                 break;
                             }
                         }
@@ -6990,19 +7013,95 @@ static void serve_loop(
 
                     if (n_draft == 0) break;
 
-                    // Verify: since draft == target (self-speculative),
-                    // all tokens should match. But we still run the acceptance check.
-                    // NOTE: In Phase 1, the draft tokens were already fed through
-                    // the model sequentially, so KV/state are already updated.
-                    // We just need to accept them.
+                    // ---- Verify draft tokens (self-speculative: always accept) ----
+                    // Phase 3 will replace this with actual draft model verify.
+                    // For now, we use verify_batch_forward to get logits and check acceptance.
+                    // But since draft == target, acceptance is always n_draft.
+                    int n_accepted = n_draft; // self-speculative: trivial accept
+
+                    // Verify with actual logits (for infrastructure testing)
+                    // NOTE: We don't re-run the model here because draft tokens were already
+                    // processed through it. We just count acceptance.
+                    // When draft model arrives (Phase 3), we'll run verify_batch_forward()
+                    // on the TARGET model with the draft tokens and compare.
 
                     g_verify_calls++;
                     g_verify_total_drafted += n_draft;
-                    g_verify_total_accepted += n_draft; // self-speculative: always accept
+                    g_verify_total_accepted += n_accepted;
+
+                    if (n_accepted < n_draft) {
+                        // ---- ROLLBACK: partial rejection ----
+                        // Restore KV cache lengths
+                        for (int i = 0; i < NUM_LAYERS; i++) {
+                            if (kv_caches[i]) {
+                                kv_caches[i]->len = snap_kv_lens[i] + n_accepted;
+                            }
+                        }
+                        // Restore GDN states (then replay accepted tokens)
+                        for (int i = 0; i < NUM_LAYERS; i++) {
+                            if (layer_states[i]) {
+                                LinearAttnState *s = (LinearAttnState *)layer_states[i];
+                                memcpy(s->conv_state,
+                                       snap_conv + (size_t)i * (conv_state_size / sizeof(float)),
+                                       conv_state_size);
+                                memcpy(s->ssm_state,
+                                       snap_ssm + (size_t)i * (ssm_state_size / sizeof(float)),
+                                       ssm_state_size);
+                            }
+                        }
+                        // Replay accepted tokens through GDN layers to restore state
+                        // (KV caches are already correct up to n_accepted)
+                        for (int r = 0; r < n_accepted; r++) {
+                            embed_lookup(wf, draft_tokens[r], hidden);
+                            for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                                int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                                if (!is_full) {
+                                    // Only replay through linear attention layers
+                                    fused_layer_forward(wf, layer, hidden,
+                                                        NULL,
+                                                        (LinearAttnState *)layer_states[layer],
+                                                        snap_pos + r,
+                                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                                        K, layer_fds[layer]);
+                                }
+                            }
+                            complete_deferred_experts();
+                        }
+                        // Re-run last accepted token through full model to get next_token
+                        if (n_accepted > 0) {
+                            embed_lookup(wf, draft_tokens[n_accepted - 1], hidden);
+                            for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                                int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                                fused_layer_forward(wf, layer, hidden,
+                                                    is_full ? kv_caches[layer] : NULL,
+                                                    is_full ? NULL : (LinearAttnState *)layer_states[layer],
+                                                    snap_pos + n_accepted - 1,
+                                                    layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                                    K, layer_fds[layer]);
+                            }
+                            complete_deferred_experts();
+                            if (final_norm_w) {
+                                float *normed = malloc(HIDDEN_DIM * sizeof(float));
+                                cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
+                                memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
+                                free(normed);
+                            }
+                            lm_head_forward(wf, hidden, logits);
+                            suppress_think_token(logits);
+                            next_token = cpu_argmax(logits, VOCAB_SIZE);
+                        }
+                        pos = snap_pos + n_accepted;
+
+                        fprintf(stderr, "[speculative] rollback: %d/%d accepted, pos=%d\n",
+                                n_accepted, n_draft, pos);
+                    } else {
+                        // Full acceptance — no rollback needed
+                        pos = draft_pos;
+                    }
 
                     // Emit accepted draft tokens
-                    for (int a = 0; a < n_draft && gen_count < max_gen; a++) {
-                        // Think budget enforcement
+                    int emit_count = (n_accepted < n_draft) ? n_accepted : n_draft;
+                    for (int a = 0; a < emit_count && gen_count < max_gen; a++) {
                         if (draft_tokens[a] == THINK_START_TOKEN) in_think = 1;
                         if (draft_tokens[a] == THINK_END_TOKEN) in_think = 0;
 
@@ -7020,9 +7119,6 @@ static void serve_loop(
                         gen_count++;
                     }
 
-                    pos = draft_pos;
-                    // next_token already set from last draft iteration
-
                     // Check EOS
                     if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) break;
                 }
@@ -7030,6 +7126,8 @@ static void serve_loop(
                 spec_done:
                 free(verify_logits);
                 free(draft_tokens);
+                free(snap_conv);
+                free(snap_ssm);
 
                 if (g_verify_calls > 0) {
                     fprintf(stderr, "[speculative] stats: %d calls, %d/%d accepted (%.1f%%)\n",
