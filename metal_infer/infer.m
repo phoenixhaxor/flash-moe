@@ -2296,22 +2296,34 @@ static void full_attention_forward(
 
     float *attn_out = calloc(q_dim, sizeof(float));
 
+    // Batch dequantize all K and V from hybrid cache once (avoid per-position overhead)
+    float *dq_k = NULL, *dq_v = NULL;
+    float *k_ptr, *v_ptr; // pointers used in attention loop
+    if (kv->hybrid && kv->len > 0) {
+        dq_k = malloc((size_t)kv->len * kv_dim * sizeof(float));
+        dq_v = malloc((size_t)kv->len * kv_dim * sizeof(float));
+        float tmp[KV_DIM];
+        for (int p = 0; p < kv->len; p++) {
+            hybrid_kv_load_k(kv->hybrid, p, tmp);
+            memcpy(dq_k + p * kv_dim, tmp, kv_dim * sizeof(float));
+            hybrid_kv_load_v(kv->hybrid, p, tmp);
+            memcpy(dq_v + p * kv_dim, tmp, kv_dim * sizeof(float));
+        }
+        k_ptr = dq_k;
+        v_ptr = dq_v;
+    } else {
+        k_ptr = kv->k_cache;
+        v_ptr = kv->v_cache;
+    }
+
     for (int h = 0; h < NUM_ATTN_HEADS; h++) {
         int kv_h = h / heads_per_kv;
         float *qh = q + h * HEAD_DIM;
 
         // Compute attention scores for all cached positions
         float *scores = malloc(kv->len * sizeof(float));
-        float tmp_kv[KV_DIM]; // temp buffer for dequantized KV (on stack, fast)
         for (int p = 0; p < kv->len; p++) {
-            float *kp;
-            if (kv->hybrid) {
-                // Dequantize K at position p from hybrid cache
-                hybrid_kv_load_k(kv->hybrid, p, tmp_kv);
-                kp = tmp_kv + kv_h * HEAD_DIM;
-            } else {
-                kp = kv->k_cache + p * kv_dim + kv_h * HEAD_DIM;
-            }
+            float *kp = k_ptr + p * kv_dim + kv_h * HEAD_DIM;
             float dot = 0.0f;
             for (int d = 0; d < HEAD_DIM; d++) {
                 dot += qh[d] * kp[d];
@@ -2325,13 +2337,7 @@ static void full_attention_forward(
         // Weighted sum of values
         float *oh = attn_out + h * HEAD_DIM;
         for (int p = 0; p < kv->len; p++) {
-            float *vp;
-            if (kv->hybrid) {
-                hybrid_kv_load_v(kv->hybrid, p, tmp_kv);
-                vp = tmp_kv + kv_h * HEAD_DIM;
-            } else {
-                vp = kv->v_cache + p * kv_dim + kv_h * HEAD_DIM;
-            }
+            float *vp = v_ptr + p * kv_dim + kv_h * HEAD_DIM;
             for (int d = 0; d < HEAD_DIM; d++) {
                 oh[d] += scores[p] * vp[d];
             }
@@ -2339,6 +2345,9 @@ static void full_attention_forward(
         free(scores);
     }
 
+    // Free batch-dequantized buffers
+    if (dq_k) free(dq_k);
+    if (dq_v) free(dq_v);
 
     // ---- Apply sigmoid gate to attention output ----
     // MLX: return self.o_proj(output * mx.sigmoid(gate))
@@ -4507,20 +4516,28 @@ static void fused_layer_forward(
             memcpy([g_metal->buf_attn_gate contents], q_gate, q_dim * sizeof(float));
             // attn_out_for_oproj will be set to NULL below — CMD2 reads buf_attn_out
         } else {
-            // CPU fallback (with optional quantized KV read)
-            float tmp_kv2[KV_DIM];
+            // CPU fallback — batch dequantize once, then standard attention
+            float *dq_k2 = NULL, *dq_v2 = NULL;
+            float *k_ptr2 = kv->k_cache, *v_ptr2 = kv->v_cache;
+            if (kv->hybrid && kv->len > 0) {
+                dq_k2 = malloc((size_t)kv->len * kv_dim * sizeof(float));
+                dq_v2 = malloc((size_t)kv->len * kv_dim * sizeof(float));
+                float tmp2[KV_DIM];
+                for (int p = 0; p < kv->len; p++) {
+                    hybrid_kv_load_k(kv->hybrid, p, tmp2);
+                    memcpy(dq_k2 + p * kv_dim, tmp2, kv_dim * sizeof(float));
+                    hybrid_kv_load_v(kv->hybrid, p, tmp2);
+                    memcpy(dq_v2 + p * kv_dim, tmp2, kv_dim * sizeof(float));
+                }
+                k_ptr2 = dq_k2;
+                v_ptr2 = dq_v2;
+            }
             for (int h = 0; h < NUM_ATTN_HEADS; h++) {
                 int kv_h = h / heads_per_kv;
                 float *qh = q + h * HEAD_DIM;
                 float *scores = malloc(kv->len * sizeof(float));
                 for (int p = 0; p < kv->len; p++) {
-                    float *kp;
-                    if (kv->hybrid) {
-                        hybrid_kv_load_k(kv->hybrid, p, tmp_kv2);
-                        kp = tmp_kv2 + kv_h * HEAD_DIM;
-                    } else {
-                        kp = kv->k_cache + p * kv_dim + kv_h * HEAD_DIM;
-                    }
+                    float *kp = k_ptr2 + p * kv_dim + kv_h * HEAD_DIM;
                     float dot = 0.0f;
                     for (int d = 0; d < HEAD_DIM; d++) dot += qh[d] * kp[d];
                     scores[p] = dot * scale;
@@ -4528,17 +4545,13 @@ static void fused_layer_forward(
                 cpu_softmax(scores, kv->len);
                 float *oh = attn_out + h * HEAD_DIM;
                 for (int p = 0; p < kv->len; p++) {
-                    float *vp;
-                    if (kv->hybrid) {
-                        hybrid_kv_load_v(kv->hybrid, p, tmp_kv2);
-                        vp = tmp_kv2 + kv_h * HEAD_DIM;
-                    } else {
-                        vp = kv->v_cache + p * kv_dim + kv_h * HEAD_DIM;
-                    }
+                    float *vp = v_ptr2 + p * kv_dim + kv_h * HEAD_DIM;
                     for (int d = 0; d < HEAD_DIM; d++) oh[d] += scores[p] * vp[d];
                 }
                 free(scores);
             }
+            if (dq_k2) free(dq_k2);
+            if (dq_v2) free(dq_v2);
             for (int i = 0; i < q_dim; i++) {
                 float g = 1.0f / (1.0f + expf(-q_gate[i]));
                 attn_out[i] *= g;
