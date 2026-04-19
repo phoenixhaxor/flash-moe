@@ -39,3 +39,4 @@ __pycache__/
 *.npz
 logs/
 *.log
+metal_infer/packed_experts_mxfp8/

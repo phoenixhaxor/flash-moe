@@ -270,10 +270,15 @@ static void dispatch_dequant_matvec(
     const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
     const float *x, float *out, int out_dim, int in_dim, int group_size
 ) {
-    if (g_use_mxfp8) {
+    if (g_use_mxfp8 && !biases) {
+        // MXFP8: E4M3 + E8M0 scales, no biases
         cpu_dequant_matvec_mxfp8(W, (const uint16_t*)scales, x, out, out_dim, in_dim, group_size);
     } else {
-        cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
+        // 8-bit affine (or mxfp8 gate with BF16 scales/biases)
+        // Gate/shared_expert_gate in mxfp8 models use group_size=64
+        int gs = group_size;
+        if (g_use_mxfp8 && biases && gs == 32) gs = 64;
+        cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, gs);
     }
 }
 static int g_freq_total_tokens = 0;  // total tokens processed while tracking
@@ -625,15 +630,9 @@ static size_t g_mxfp8_zero_biases_size = 0;
 static uint16_t *get_biases_ptr(WeightFile *wf, const char *name, size_t min_count) {
     uint16_t *ptr = (uint16_t *)get_tensor_ptr(wf, name);
     if (ptr) return ptr;
-    if (!g_use_mxfp8) return NULL;
-    // Allocate or grow zero buffer for MXFP8
-    size_t needed = min_count * sizeof(uint16_t);
-    if (needed > g_mxfp8_zero_biases_size) {
-        g_mxfp8_zero_biases = realloc(g_mxfp8_zero_biases, needed);
-        memset(g_mxfp8_zero_biases, 0, needed);
-        g_mxfp8_zero_biases_size = needed;
-    }
-    return g_mxfp8_zero_biases;
+    // Tensor not found — return NULL (not a zero buffer)
+    // The caller checks biases != NULL to decide dequant path
+    return NULL;
 }
 
 static TensorInfo *get_tensor_info(WeightFile *wf, const char *name) {
@@ -778,8 +777,9 @@ static void cpu_dequant_matvec(
 ) {
     int num_groups = in_dim / group_size;
     // Bit-width aware: 4-bit = 8 vals/u32, 8-bit = 4 vals/u32, 2-bit = 16 vals/u32
-    int vals_per_u32 = g_use_8bit ? 4 : (g_use_2bit ? 16 : 8);
-    int bits = g_use_8bit ? 8 : (g_use_2bit ? 2 : 4);
+    // Gate/shared_expert_gate in mxfp8 use 8-bit affine format
+    int vals_per_u32 = (g_use_8bit || g_use_mxfp8) ? 4 : (g_use_2bit ? 16 : 8);
+    int bits = (g_use_8bit || g_use_mxfp8) ? 8 : (g_use_2bit ? 2 : 4);
     uint32_t mask = (1u << bits) - 1;  // 0xFF for 8-bit, 0xF for 4-bit, 0x3 for 2-bit
     int packed_per_group = group_size / vals_per_u32;
     int packed_cols = in_dim / vals_per_u32;
@@ -821,11 +821,8 @@ static inline float e4m3_to_f32(uint8_t v) {
     
     if (exponent == 0 && mantissa == 0) return 0.0f;
     
-    // NaN
-    if (exponent == 15 && mantissa == 7) {
-        uint32_t nan_bits = sign ? 0xFFC00000u : 0x7FC00000u;
-        float r; memcpy(&r, &nan_bits, 4); return r;
-    }
+    // NaN in E4M3 — return 0 instead of NaN to prevent propagation
+    if (exponent == 15 && mantissa == 7) return 0.0f;
     
     // Normal: value = (-1)^sign * 2^(exp-7) * (1 + mant/8)
     int fp32_exp = (int)exponent - 7 + 127;
@@ -841,37 +838,40 @@ static inline float e4m3_to_f32(uint8_t v) {
     return r;
 }
 
-// E8M0 to FP32: pure power-of-2 scale (sign + 7-bit exponent)
-// value = (-1)^sign * 2^(exp7 - 127)
+// E8M0 to FP32: pure power-of-2 scale (8-bit exponent, no sign, no mantissa)
+// value = 2^(exponent - 127)
 static inline float e8m0_to_f32(uint8_t b) {
-    if (b == 0xFF) return NAN;
-    uint32_t sign = (b >> 7) & 1;
-    uint32_t exp7 = b & 0x7F;
-    uint32_t bits = (sign << 31) | (exp7 << 23);
+    if (b == 0x00) return 0.0f;  // 2^-127 ≈ 0, treat as zero
+    // Clamp to avoid float32 overflow in matvec:
+    // max product = max_E4M3(448) × scale × max_input(~3) × group_size(32)
+    // = 448 × scale × 96. For safety: scale × 43008 < FLT_MAX(3.4e38)
+    // → scale < 7.9e33 = 2^112.6. Clamp at byte 239 (2^112).
+    // 0xFF is formally NaN in E8M0, but some models use it — clamp it too.
+    if (b > 239) b = 239;  // 2^(239-127)=2^112 ≈ 5.19e33
+    // FP32: sign=0, exponent=b (biased by 127 already), mantissa=0
+    uint32_t bits = ((uint32_t)b) << 23;
     float r; memcpy(&r, &bits, 4);
     return r;
 }
 
-// MXFP8 dequant matvec: out[out_dim] = W * x[in_dim]
-// Weights are FP8 E4M3 packed 4-per-uint32
-// Scales are E8M0 (uint8 stored as uint16) per group of 32
 static void cpu_dequant_matvec_mxfp8(
-    const uint32_t *W, const uint16_t *scales,
+    const uint32_t *W, const uint16_t *scales_u16,
     const float *x, float *out,
     int out_dim, int in_dim, int group_size
 ) {
+    // Scales are actually uint8 (E8M0), cast the pointer
+    const uint8_t *scales = (const uint8_t *)scales_u16;
     int num_groups = in_dim / group_size;
     int packed_cols = in_dim / 4;
     int packed_per_group = group_size / 4;
     
     for (int row = 0; row < out_dim; row++) {
-        float acc = 0.0f;
+        double acc = 0.0;
         const uint32_t *w_row = W + row * packed_cols;
-        const uint16_t *s_row = scales + row * num_groups;
+        const uint8_t *s_row = scales + row * num_groups;
         
         for (int g = 0; g < num_groups; g++) {
-            // E8M0 scale: uint16 → low byte = E8M0 scale factor
-            float scale = e8m0_to_f32((uint8_t)(s_row[g] & 0xFF));
+            float scale = e8m0_to_f32(s_row[g]);
             int base_packed = g * packed_per_group;
             int base_x = g * group_size;
             
@@ -879,10 +879,58 @@ static void cpu_dequant_matvec_mxfp8(
                 uint32_t packed = w_row[base_packed + p];
                 int x_base = base_x + p * 4;
                 
-                acc += e4m3_to_f32((packed >>  0) & 0xFF) * scale * x[x_base + 0];
-                acc += e4m3_to_f32((packed >>  8) & 0xFF) * scale * x[x_base + 1];
-                acc += e4m3_to_f32((packed >> 16) & 0xFF) * scale * x[x_base + 2];
-                acc += e4m3_to_f32((packed >> 24) & 0xFF) * scale * x[x_base + 3];
+                // INT8 (signed) values
+                int8_t b0 = (int8_t)((packed >>  0) & 0xFF);
+                int8_t b1 = (int8_t)((packed >>  8) & 0xFF);
+                int8_t b2 = (int8_t)((packed >> 16) & 0xFF);
+                int8_t b3 = (int8_t)((packed >> 24) & 0xFF);
+                
+                acc += (double)b0 * (double)scale * (double)x[x_base + 0]
+                     + (double)b1 * (double)scale * (double)x[x_base + 1]
+                     + (double)b2 * (double)scale * (double)x[x_base + 2]
+                     + (double)b3 * (double)scale * (double)x[x_base + 3];
+            }
+        }
+        // Clamp to prevent inf propagation
+        if (!isfinite(acc) || acc > 1e6) acc = 1e6;
+        else if (acc < -1e6) acc = -1e6;
+        out[row] = (float)acc;
+    }
+}
+
+// Hybrid dequant matvec: E4M3 weights + BF16 scales + BF16 biases (per-group)
+// Used by gate and shared_expert_gate in MXFP8 models (group_size=64)
+static void cpu_dequant_matvec_e4m3_bf16(
+    const uint32_t *W, const uint16_t *scales_bf16, const uint16_t *biases_bf16,
+    const float *x, float *out,
+    int out_dim, int in_dim, int group_size
+) {
+    // Gate/shared_expert_gate in MXFP8 models use group_size=64, not 32
+    if (group_size == 32) group_size = 64;
+    int num_groups = in_dim / group_size;
+    int packed_cols = in_dim / 4;
+    int packed_per_group = group_size / 4;
+    
+    for (int row = 0; row < out_dim; row++) {
+        float acc = 0.0f;
+        const uint32_t *w_row = W + row * packed_cols;
+        const uint16_t *s_row = scales_bf16 + row * num_groups;
+        const uint16_t *b_row = biases_bf16 + row * num_groups;
+        
+        for (int g = 0; g < num_groups; g++) {
+            float scale = bf16_to_f32(s_row[g]);
+            float bias = bf16_to_f32(b_row[g]);
+            int base_packed = g * packed_per_group;
+            int base_x = g * group_size;
+            
+            for (int p = 0; p < packed_per_group; p++) {
+                uint32_t packed = w_row[base_packed + p];
+                int x_base = base_x + p * 4;
+                
+                acc += (e4m3_to_f32((packed >>  0) & 0xFF) * scale + bias) * x[x_base + 0];
+                acc += (e4m3_to_f32((packed >>  8) & 0xFF) * scale + bias) * x[x_base + 1];
+                acc += (e4m3_to_f32((packed >> 16) & 0xFF) * scale + bias) * x[x_base + 2];
+                acc += (e4m3_to_f32((packed >> 24) & 0xFF) * scale + bias) * x[x_base + 3];
             }
         }
         out[row] = acc;
@@ -1480,7 +1528,16 @@ static void gpu_dequant_matvec(
     // Compute offsets into the mmap'd weight buffer
     NSUInteger w_off = (NSUInteger)((const char *)W_packed - (const char *)[ctx->wf_buf contents]);
     NSUInteger s_off = (NSUInteger)((const char *)scales   - (const char *)[ctx->wf_buf contents]);
-    NSUInteger b_off = (NSUInteger)((const char *)biases   - (const char *)[ctx->wf_buf contents]);
+    NSUInteger b_off;
+    if (g_use_mxfp8 && biases) {
+        const char *bias_start = (const char *)biases;
+        const char *wf_start   = (const char *)[ctx->wf_buf contents];
+        const char *wf_end     = wf_start + [ctx->wf_buf length];
+        b_off = (bias_start >= wf_start && bias_start < wf_end)
+            ? (NSUInteger)(bias_start - wf_start) : 0;
+    } else {
+        b_off = (NSUInteger)((const char *)biases   - (const char *)[ctx->wf_buf contents]);
+    }
 
     // Ensure output buffer is large enough
     id<MTLBuffer> o_buf = ctx->buf_output;
@@ -1529,7 +1586,14 @@ static void fast_dequant_matvec(
     const float *x, float *out,
     int out_dim, int in_dim, int group_size
 ) {
-    if (g_metal && g_metal->wf_buf) {
+    if (g_use_mxfp8 && !biases) {
+        // MXFP8: E4M3 weights + uint8 E8M0 scales, no biases
+        cpu_dequant_matvec_mxfp8(W, scales, x, out, out_dim, in_dim, group_size);
+    } else if (g_use_mxfp8 && biases) {
+        // Gate/shared_expert_gate: int8 affine weights + BF16 scales + BF16 biases
+        // These use standard 8-bit affine format, NOT E4M3
+        dispatch_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
+    } else if (g_metal && g_metal->wf_buf) {
         gpu_dequant_matvec(g_metal, W, scales, biases, x, out,
                            (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size);
     } else {
@@ -1569,7 +1633,17 @@ static void gpu_batch_matvec(
         BatchMatvecSpec *s = &specs[i];
         NSUInteger w_off = (NSUInteger)((const char *)s->W      - (const char *)[ctx->wf_buf contents]);
         NSUInteger s_off = (NSUInteger)((const char *)s->scales  - (const char *)[ctx->wf_buf contents]);
-        NSUInteger b_off = (NSUInteger)((const char *)s->biases  - (const char *)[ctx->wf_buf contents]);
+        // For MXFP8: biases pointer may be a heap buffer (not in wf_buf), so compute offset carefully
+        NSUInteger b_off;
+        if (g_use_mxfp8 && s->biases) {
+            const char *bias_start = (const char *)s->biases;
+            const char *wf_start   = (const char *)[ctx->wf_buf contents];
+            const char *wf_end     = wf_start + [ctx->wf_buf length];
+            b_off = (bias_start >= wf_start && bias_start < wf_end)
+                ? (NSUInteger)(bias_start - wf_start) : 0;
+        } else {
+            b_off = (NSUInteger)((const char *)s->biases  - (const char *)[ctx->wf_buf contents]);
+        }
 
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
 
@@ -1619,11 +1693,37 @@ static void gpu_encode_batch_matvec(
     id<MTLCommandBuffer> cmdbuf,
     BatchMatvecSpec *specs, int num_specs
 ) {
+    if (g_use_mxfp8) {
+        // MXFP8: CPU path — input is in ctx->buf_input, write to batch_out then flush
+        const float *x = (const float *)[ctx->buf_input contents];
+        for (int i = 0; i < num_specs; i++) {
+            BatchMatvecSpec *s = &specs[i];
+            float *tmp = (float *)[ctx->batch_out[s->batch_slot] contents];
+            if (!s->biases) {
+                cpu_dequant_matvec_mxfp8(s->W, s->scales, x, tmp,
+                                   s->out_dim, s->in_dim, s->group_size);
+            } else {
+                // Hybrid: E4M3 weights + BF16 scales + BF16 biases
+                cpu_dequant_matvec_e4m3_bf16(s->W, s->scales, s->biases, x, tmp,
+                                   s->out_dim, s->in_dim, s->group_size);
+            }
+        }
+        return;
+    }
     for (int i = 0; i < num_specs; i++) {
         BatchMatvecSpec *s = &specs[i];
         NSUInteger w_off = (NSUInteger)((const char *)s->W      - (const char *)[ctx->wf_buf contents]);
         NSUInteger s_off = (NSUInteger)((const char *)s->scales  - (const char *)[ctx->wf_buf contents]);
-        NSUInteger b_off = (NSUInteger)((const char *)s->biases  - (const char *)[ctx->wf_buf contents]);
+        NSUInteger b_off;
+        if (g_use_mxfp8 && s->biases) {
+            const char *bias_start = (const char *)s->biases;
+            const char *wf_start   = (const char *)[ctx->wf_buf contents];
+            const char *wf_end     = wf_start + [ctx->wf_buf length];
+            b_off = (bias_start >= wf_start && bias_start < wf_end)
+                ? (NSUInteger)(bias_start - wf_start) : 0;
+        } else {
+            b_off = (NSUInteger)((const char *)s->biases  - (const char *)[ctx->wf_buf contents]);
+        }
 
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
 
@@ -2083,12 +2183,25 @@ static void fast_batch_matvec(
     const float *x, uint32_t x_dim,
     BatchMatvecSpec *specs, int num_specs
 ) {
-    if (g_metal && g_metal->wf_buf) {
+    if (g_use_mxfp8) {
+        // MXFP8: use appropriate CPU path based on whether tensor has biases
+        for (int i = 0; i < num_specs; i++) {
+            BatchMatvecSpec *s = &specs[i];
+            if (!s->biases) {
+                cpu_dequant_matvec_mxfp8(s->W, s->scales, x, s->out_cpu,
+                                   s->out_dim, s->in_dim, s->group_size);
+            } else {
+                // Hybrid: E4M3 weights + BF16 scales + BF16 biases
+                cpu_dequant_matvec_e4m3_bf16(s->W, s->scales, s->biases, x, s->out_cpu,
+                                   s->out_dim, s->in_dim, s->group_size);
+            }
+        }
+    } else if (g_metal && g_metal->wf_buf) {
         gpu_batch_matvec(g_metal, x, x_dim, specs, num_specs);
     } else {
         for (int i = 0; i < num_specs; i++) {
             BatchMatvecSpec *s = &specs[i];
-            dispatch_dequant_matvec(s->W, s->scales, s->biases, x, s->out_cpu,
+            fast_dequant_matvec(s->W, s->scales, s->biases, x, s->out_cpu,
                                s->out_dim, s->in_dim, s->group_size);
         }
     }
@@ -2763,7 +2876,7 @@ static void linear_attention_forward(
         // g = exp(-exp(A_log) * softplus(a + dt_bias))
         float a_val = alpha[vh];
         float dt_b = dt_bias_bf16 ? bf16_to_f32(dt_bias_bf16[vh]) : 0.0f;
-        float A_val = A_log ? expf(A_log[vh]) : 1.0f;
+        float A_val = A_log ? expf(bf16_to_f32(((uint16_t*)A_log)[vh])) : 1.0f;
         float softplus_val = logf(1.0f + expf(a_val + dt_b));  // softplus(a + dt_bias)
         g_decay[vh] = expf(-A_val * softplus_val);
 
@@ -2969,7 +3082,7 @@ static void moe_forward(
             int eidx = expert_indices[k];
             off_t expert_offset = (off_t)eidx * esz;
 
-            if (g_metal && g_metal->buf_expert_data) {
+            if (g_metal && g_metal->buf_expert_data && !g_use_mxfp8) {
                 // GPU path: pread directly into Metal buffer, run gate+up+swiglu+down on GPU
                 void *expert_buf_ptr = [g_metal->buf_expert_data contents];
                 ssize_t nread = pread(packed_fd, expert_buf_ptr, esz, expert_offset);
@@ -2993,25 +3106,35 @@ static void moe_forward(
 
                 uint32_t *gw = (uint32_t *)expert_data;
                 uint16_t *gs_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(GATE_S)));
-                uint16_t *gb_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(GATE_B)));
+                uint16_t *gb_p = g_use_mxfp8 ? NULL : (uint16_t *)((char *)expert_data + (EXPERT_OFF(GATE_B)));
                 uint32_t *uw = (uint32_t *)((char *)expert_data + (EXPERT_OFF(UP_W)));
                 uint16_t *us_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(UP_S)));
-                uint16_t *ub_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(UP_B)));
+                uint16_t *ub_p = g_use_mxfp8 ? NULL : (uint16_t *)((char *)expert_data + (EXPERT_OFF(UP_B)));
                 uint32_t *dw = (uint32_t *)((char *)expert_data + (EXPERT_OFF(DOWN_W)));
                 uint16_t *ds_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(DOWN_S)));
-                uint16_t *db_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(DOWN_B)));
+                uint16_t *db_p = g_use_mxfp8 ? NULL : (uint16_t *)((char *)expert_data + (EXPERT_OFF(DOWN_B)));
 
                 float *gate_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
                 float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
                 float *act_out = malloc(MOE_INTERMEDIATE * sizeof(float));
 
-                dispatch_dequant_matvec(gw, gs_p, gb_p, h_post, gate_proj_out,
-                                   MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
-                dispatch_dequant_matvec(uw, us_p, ub_p, h_post, up_proj_out,
-                                   MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
-                cpu_swiglu(gate_proj_out, up_proj_out, act_out, MOE_INTERMEDIATE);
-                dispatch_dequant_matvec(dw, ds_p, db_p, act_out, expert_out,
-                                   HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE);
+                if (g_use_mxfp8) {
+                    cpu_dequant_matvec_mxfp8(gw, gs_p, h_post, gate_proj_out,
+                                       MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
+                    cpu_dequant_matvec_mxfp8(uw, us_p, h_post, up_proj_out,
+                                       MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
+                    cpu_swiglu(gate_proj_out, up_proj_out, act_out, MOE_INTERMEDIATE);
+                    cpu_dequant_matvec_mxfp8(dw, ds_p, act_out, expert_out,
+                                       HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE);
+                } else {
+                    fast_dequant_matvec(gw, gs_p, gb_p, h_post, gate_proj_out,
+                                       MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
+                    fast_dequant_matvec(uw, us_p, ub_p, h_post, up_proj_out,
+                                       MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
+                    cpu_swiglu(gate_proj_out, up_proj_out, act_out, MOE_INTERMEDIATE);
+                    fast_dequant_matvec(dw, ds_p, db_p, act_out, expert_out,
+                                       HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE);
+                }
 
                 free(gate_proj_out);
                 free(up_proj_out);
@@ -3114,26 +3237,31 @@ static void embed_lookup(WeightFile *wf, int token_id, float *out) {
     int num_groups = s_info->shape[1];
 
     uint32_t *W = (uint32_t *)((char *)wf->data + w_info->offset);
+    uint8_t *S_u8 = g_use_mxfp8 ? (uint8_t *)((char *)wf->data + s_info->offset) : NULL;
     uint16_t *S = (uint16_t *)((char *)wf->data + s_info->offset);
     uint16_t *B = b_info ? (uint16_t *)((char *)wf->data + b_info->offset) : NULL;
 
     const uint32_t *w_row = W + (size_t)token_id * packed_cols;
     const uint16_t *s_row = S + (size_t)token_id * num_groups;
+    const uint8_t *s_row_u8 = S_u8 ? (S_u8 + (size_t)token_id * num_groups) : NULL;
     const uint16_t *b_row = B ? (B + (size_t)token_id * num_groups) : NULL;
 
     int group_size = HIDDEN_DIM / num_groups;
 
     if (g_use_mxfp8) {
-        // MXFP8: FP8 E4M3 weights, E8M0 scales (uint8 in uint16), no bias
+        // MXFP8: FP8 E4M3 weights, E8M0 scales (uint8), no bias
         int vals_per_u32 = 4;
         int packed_per_group = group_size / vals_per_u32;
         for (int g = 0; g < num_groups; g++) {
-            float scale = e8m0_to_f32((uint8_t)(s_row[g] & 0xFF));
+            float scale = e8m0_to_f32(s_row_u8[g]);
             for (int p = 0; p < packed_per_group; p++) {
                 uint32_t packed = w_row[g * packed_per_group + p];
                 int base = g * group_size + p * vals_per_u32;
                 for (int n = 0; n < vals_per_u32; n++) {
-                    out[base + n] = e4m3_to_f32((packed >> (n * 8)) & 0xFF) * scale;
+                    float v = e4m3_to_f32((packed >> (n * 8)) & 0xFF) * scale;
+                    // Clamp to prevent inf/NaN
+                    if (v > 1e30f) v = 1e30f; else if (v < -1e30f) v = -1e30f;
+                    out[base + n] = v;
                 }
             }
         }
@@ -3184,7 +3312,18 @@ static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) 
 
     if (g_use_mxfp8) {
         // MXFP8: use mxfp8 dequant path for lm_head
-        cpu_dequant_matvec_mxfp8(W, S, hidden, logits, VOCAB_SIZE, HIDDEN_DIM, GROUP_SIZE);
+        // Compute actual group_size from tensor shapes (weight shape is packed: in_dim/4)
+        int actual_gs = (w_info->shape[1] * 4) / s_info->shape[1];
+        // Check hidden for NaN/inf
+        int h_nans = 0, h_infs = 0;
+        for (int i = 0; i < HIDDEN_DIM; i++) {
+            if (isnan(hidden[i])) h_nans++;
+            if (isinf(hidden[i])) h_infs++;
+        }
+        if (h_nans || h_infs) {
+            fprintf(stderr, "[LMHEAD] WARNING: hidden has %d NaN, %d inf before lm_head!\n", h_nans, h_infs);
+        }
+        cpu_dequant_matvec_mxfp8(W, S, hidden, logits, VOCAB_SIZE, HIDDEN_DIM, actual_gs);
     } else {
         fast_dequant_matvec(W, S, B, hidden, logits, VOCAB_SIZE, HIDDEN_DIM, GROUP_SIZE);
     }
@@ -4030,6 +4169,7 @@ static void finalize_deferred_experts(void) {
         // Read back and accumulate routed expert outputs
         float moe_out[HIDDEN_DIM];
         memset(moe_out, 0, sizeof(moe_out));
+        if (g_use_mxfp8) fprintf(stderr, "[DBG] finalize: K=%d gpu_combined=%d\n", g_deferred.actual_K, g_deferred.gpu_combined);
         for (int k = 0; k < g_deferred.actual_K; k++) {
             if (!g_deferred.valid[k]) continue;
             float *expert_result = (float *)[g_metal->buf_multi_expert_out[k] contents];
@@ -4185,6 +4325,8 @@ static void fused_layer_forward(
     int K,                   // number of active experts
     int packed_fd            // fd for packed expert file
 ) {
+    fprintf(stderr, "[FLF] layer=%d START\n", layer_idx);
+    { float rms=0; for(int i=0;i<HIDDEN_DIM;i++) rms+=hidden[i]*hidden[i]; rms=sqrtf(rms/HIDDEN_DIM); fprintf(stderr, "[FLF] layer=%d input_rms=%.4f\n", layer_idx, rms); }
     double t_layer_start = 0, t0 = 0, t1 = 0;
     if (g_timing_enabled) { t_layer_start = now_ms(); }
 
@@ -4211,8 +4353,8 @@ static void fused_layer_forward(
         k_out = s_k_proj_out;
         v_out = s_v_proj_out;
 
-        if (lc->q_w && lc->q_s && lc->q_b && lc->k_w && lc->k_s && lc->k_b &&
-            lc->v_w && lc->v_s && lc->v_b) {
+        if (lc->q_w && lc->q_s && lc->k_w && lc->k_s &&
+            lc->v_w && lc->v_s) {
             attn_specs[0] = (BatchMatvecSpec){ lc->q_w, lc->q_s, lc->q_b, q_proj_out, (uint32_t)q_proj_dim, HIDDEN_DIM, GROUP_SIZE, 0 };
             attn_specs[1] = (BatchMatvecSpec){ lc->k_w, lc->k_s, lc->k_b, k_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 1 };
             attn_specs[2] = (BatchMatvecSpec){ lc->v_w, lc->v_s, lc->v_b, v_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 2 };
@@ -4227,8 +4369,8 @@ static void fused_layer_forward(
         beta_out = s_beta_proj_out;
         alpha_out = s_alpha_proj_out;
 
-        if (lc->qkv_w && lc->qkv_s && lc->qkv_b && lc->z_w && lc->z_s && lc->z_b &&
-            lc->b_w && lc->b_s && lc->b_b && lc->a_w && lc->a_s && lc->a_b) {
+        if (lc->qkv_w && lc->qkv_s && lc->z_w && lc->z_s &&
+            lc->b_w && lc->b_s && lc->a_w && lc->a_s) {
             attn_specs[0] = (BatchMatvecSpec){ lc->qkv_w, lc->qkv_s, lc->qkv_b, qkv_out,   (uint32_t)qkv_dim,            HIDDEN_DIM, GROUP_SIZE, 0 };
             attn_specs[1] = (BatchMatvecSpec){ lc->z_w,   lc->z_s,   lc->z_b,   z_out,      (uint32_t)z_dim,              HIDDEN_DIM, GROUP_SIZE, 1 };
             attn_specs[2] = (BatchMatvecSpec){ lc->b_w,   lc->b_s,   lc->b_b,   beta_out,   (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 2 };
@@ -4253,7 +4395,7 @@ static void fused_layer_forward(
                           !is_full && g_metal && g_metal->delta_net_step &&
                           g_metal->conv1d_step && g_metal->rms_norm_qk &&
                           g_metal->compute_decay_beta && g_metal->gated_rms_norm &&
-                          g_metal->wf_buf &&
+                          g_metal->wf_buf && !g_use_mxfp8 &&
                           linear_layer_idx >= 0 && linear_layer_idx < NUM_LINEAR_LAYERS &&
                           lc->conv1d_w && lc->A_log && lc->dt_bias && lc->gated_norm_w &&
                           !linear_attn_bypass);
@@ -4262,7 +4404,7 @@ static void fused_layer_forward(
     // If so, buf_input already contains the normalized input for this layer's CMD1.
     // We can submit CMD1 immediately — the GPU queue serializes CMD3(N-1) then CMD1(N).
     // FIX: For layer 0, there is no previous layer, so never use FAST PATH.
-    int prev_gpu_combined = (layer_idx > 0 && g_deferred.active && g_deferred.gpu_combined);
+    int prev_gpu_combined = (layer_idx > 0 && g_deferred.active && g_deferred.gpu_combined && !g_use_mxfp8);
 
     if (prev_gpu_combined && g_metal && g_metal->wf_buf && num_attn_specs > 0) {
         // ---- FAST PATH: GPU-combined previous CMD3 ----
@@ -4406,8 +4548,12 @@ static void fused_layer_forward(
 
 
         // Submit CMD1: attention projections
+        fprintf(stderr, "[CMD1] layer=%d normed rms=%.4f first5=[%.4f,%.4f,%.4f,%.4f,%.4f]\n",
+            layer_idx,
+            sqrtf(normed[0]*normed[0]+normed[1]*normed[1]+normed[2]*normed[2]+normed[3]*normed[3]+normed[4]*normed[4])/sqrtf(5),
+            normed[0], normed[1], normed[2], normed[3], normed[4]);
         if (g_timing_enabled) { t0 = now_ms(); }
-        if (g_metal && g_metal->wf_buf && num_attn_specs > 0) {
+        if (g_metal && g_metal->wf_buf && num_attn_specs > 0 && !g_use_mxfp8) {
             memcpy([g_metal->buf_input contents], normed, HIDDEN_DIM * sizeof(float));
             cmd1 = [g_metal->queue commandBuffer];
             gpu_encode_batch_matvec(g_metal, cmd1, attn_specs, num_attn_specs);
@@ -4505,9 +4651,10 @@ static void fused_layer_forward(
 
             [cmd1 commit];
         } else {
+            // CPU fallback for attention projections
             for (int i = 0; i < num_attn_specs; i++) {
                 BatchMatvecSpec *s = &attn_specs[i];
-                dispatch_dequant_matvec(s->W, s->scales, s->biases, normed, s->out_cpu,
+                fast_dequant_matvec(s->W, s->scales, s->biases, normed, s->out_cpu,
                                    s->out_dim, s->in_dim, s->group_size);
             }
         }
@@ -4523,6 +4670,14 @@ static void fused_layer_forward(
 
         }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
+        // DEBUG: print CMD1 output
+        if (qkv_out) {
+            int dbg_dim = 8192 + 8192 + 8192; // qkv total = LINEAR_CONV_DIM = 8192
+            float rms_qkv = 0;
+            for (int i = 0; i < 100; i++) rms_qkv += qkv_out[i]*qkv_out[i];
+            fprintf(stderr, "[CMD1] layer=%d qkv_out rms(100)=%.4f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                layer_idx, sqrtf(rms_qkv/100), qkv_out[0], qkv_out[1], qkv_out[2], qkv_out[3], qkv_out[4]);
+        }
     }
 
     // =====================================================================
@@ -4547,7 +4702,7 @@ static void fused_layer_forward(
         memset(spec_scores, 0, NUM_EXPERTS * sizeof(float));
 
         // Gate projection matvec on pre-attention normed input (CPU, ~0.1ms for 512x4096)
-        dispatch_dequant_matvec(lc->gate_w, lc->gate_s, lc->gate_b,
+        fast_dequant_matvec(lc->gate_w, lc->gate_s, lc->gate_b,
                            normed, spec_scores,
                            NUM_EXPERTS, HIDDEN_DIM, GROUP_SIZE);
         cpu_softmax(spec_scores, NUM_EXPERTS);
@@ -4784,9 +4939,22 @@ static void fused_layer_forward(
             uint16_t *conv_w = lc->conv1d_w;
             float *conv_out = s_conv_out;
             memset(conv_out, 0, qkv_dim * sizeof(float));
+            if (g_use_mxfp8 && layer_idx < 2) {
+                int nc=0; for(int i=0;i<qkv_dim;i++) if(isnan(qkv_out[i])) nc++;
+                float r=0; for(int i=0;i<qkv_dim;i++) r+=qkv_out[i]*qkv_out[i];
+                fprintf(stderr,"[DBG] L%d qkv_out pre-conv rms=%.6f nans=%d/%d first3=[%.6f,%.6f,%.6f] last3=[%.6f,%.6f,%.6f]\n",
+                    layer_idx, sqrtf(r/qkv_dim), nc, qkv_dim, qkv_out[0], qkv_out[1], qkv_out[2], qkv_out[qkv_dim-3], qkv_out[qkv_dim-2], qkv_out[qkv_dim-1]);
+            }
             if (conv_w) {
                 cpu_conv1d_step(la_state->conv_state, qkv_out, conv_w, conv_out,
                                 qkv_dim, CONV_KERNEL_SIZE);
+            }
+            if (g_use_mxfp8 && layer_idx < 2) {
+                int nc=0; for(int i=0;i<qkv_dim;i++) if(isnan(conv_out[i])) nc++;
+                float r=0; for(int i=0;i<qkv_dim;i++) r+=conv_out[i]*conv_out[i];
+                float r_k=0; for(int i=0;i<LINEAR_TOTAL_KEY;i++) r_k+=conv_out[LINEAR_TOTAL_KEY+i]*conv_out[LINEAR_TOTAL_KEY+i];
+                fprintf(stderr,"[DBG] L%d conv_out rms=%.6f nans=%d/%d k_region_rms=%.6f\n",
+                    layer_idx, sqrtf(r/qkv_dim), nc, qkv_dim, sqrtf(r_k/LINEAR_TOTAL_KEY));
             }
             // Update conv state
             memmove(la_state->conv_state, la_state->conv_state + qkv_dim,
@@ -4817,6 +4985,13 @@ static void fused_layer_forward(
             float *A_log = lc->A_log;
             uint16_t *dt_bias_bf16 = lc->dt_bias;
 
+            // [MXFP8 DEBUG]
+            if (g_use_mxfp8 && layer_idx < 2) {
+                {float r=0; for(int i=0;i<LINEAR_NUM_V_HEADS;i++) r+=alpha_out[i]*alpha_out[i]; fprintf(stderr,"[DBG] L%d alpha rms=%.4f first3=[%.4f,%.4f,%.4f]\n",layer_idx,sqrtf(r/LINEAR_NUM_V_HEADS),alpha_out[0],alpha_out[1],alpha_out[2]);}
+                {float r=0; for(int i=0;i<LINEAR_NUM_V_HEADS;i++) r+=beta_out[i]*beta_out[i]; fprintf(stderr,"[DBG] L%d beta rms=%.4f first3=[%.4f,%.4f,%.4f]\n",layer_idx,sqrtf(r/LINEAR_NUM_V_HEADS),beta_out[0],beta_out[1],beta_out[2]);}
+                if (A_log) fprintf(stderr,"[DBG] L%d A_log[0:4]=[%.4f,%.4f,%.4f,%.4f]\n",layer_idx,A_log[0],A_log[1],A_log[2],A_log[3]);
+            }
+
             float *out_values = s_out_vals;
             memset(out_values, 0, LINEAR_TOTAL_VALUE * sizeof(float));
             int k_heads_per_v = LINEAR_NUM_V_HEADS / LINEAR_NUM_K_HEADS;
@@ -4826,7 +5001,8 @@ static void fused_layer_forward(
             for (int vh = 0; vh < LINEAR_NUM_V_HEADS; vh++) {
                 float a_val = alpha_out[vh];
                 float dt_b = dt_bias_bf16 ? bf16_to_f32(dt_bias_bf16[vh]) : 0.0f;
-                float A_val = A_log ? expf(A_log[vh]) : 1.0f;
+                // A_log is BF16 data — must dequant, not read as float
+                float A_val = A_log ? expf(bf16_to_f32(((uint16_t*)A_log)[vh])) : 1.0f;
                 float softplus_val = logf(1.0f + expf(a_val + dt_b));
                 g_decay[vh] = expf(-A_val * softplus_val);
                 beta_gate_arr[vh] = cpu_sigmoid(beta_out[vh]);
@@ -4839,7 +5015,8 @@ static void fused_layer_forward(
             int linear_layer_idx = layer_idx - (layer_idx + 1) / FULL_ATTN_INTERVAL;
 
             // GPU delta-net path (falls back to CPU if pipeline unavailable)
-            if (g_metal && g_metal->delta_net_step &&
+            // For mxfp8: force CPU path to avoid potential GPU shader issues
+            if (g_metal && g_metal->delta_net_step && !g_use_mxfp8 &&
                 linear_layer_idx >= 0 && linear_layer_idx < NUM_LINEAR_LAYERS) {
                 // Upload CPU-computed data to GPU scratch buffers
                 memcpy([g_metal->buf_delta_q contents], lin_q, LINEAR_TOTAL_KEY * sizeof(float));
@@ -4882,8 +5059,6 @@ static void fused_layer_forward(
                     cblas_sscal(LINEAR_VALUE_DIM * LINEAR_KEY_DIM, g, S, 1);
 
                     // Step 2: kv_mem = S @ k (each row dot k)
-                    // S is [VALUE_DIM x KEY_DIM] row-major, k is [KEY_DIM]
-                    // kv_mem[vi] = sum_ki(S[vi,ki] * k[ki]) = matrix-vector: S @ k
                     float kv_mem_vec[LINEAR_VALUE_DIM];
                     cblas_sgemv(CblasRowMajor, CblasNoTrans,
                                 LINEAR_VALUE_DIM, LINEAR_KEY_DIM,
@@ -4891,13 +5066,11 @@ static void fused_layer_forward(
                                 0.0f, kv_mem_vec, 1);
 
                     // Step 3: delta = (v - kv_mem) * beta, then rank-1 update S += k * delta^T
-                    // delta[vi] = (v[vi] - kv_mem[vi]) * beta
                     float delta_vec[LINEAR_VALUE_DIM];
                     for (int vi = 0; vi < LINEAR_VALUE_DIM; vi++) {
                         delta_vec[vi] = (v_h[vi] - kv_mem_vec[vi]) * b_gate;
                     }
                     // S += delta @ k^T (rank-1 update: sger)
-                    // S[vi,ki] += delta[vi] * k[ki]
                     cblas_sger(CblasRowMajor, LINEAR_VALUE_DIM, LINEAR_KEY_DIM,
                                1.0f, delta_vec, 1, k_h, 1, S, LINEAR_KEY_DIM);
 
@@ -4908,6 +5081,23 @@ static void fused_layer_forward(
                                 LINEAR_VALUE_DIM, LINEAR_KEY_DIM,
                                 1.0f, S, LINEAR_KEY_DIM, q_h, 1,
                                 0.0f, o_h, 1);
+                    
+                    // Per-head NaN debug for mxfp8
+                    if (g_use_mxfp8 && layer_idx == 0) {
+                        int nc = 0;
+                        for (int vi = 0; vi < LINEAR_VALUE_DIM; vi++) if (isnan(o_h[vi])) nc++;
+                        if (nc > 0) {
+                            float sr = 0; for (int vi = 0; vi < LINEAR_VALUE_DIM; vi++) sr += S[vi]*S[vi];
+                            fprintf(stderr, "[DBG] L0 vh=%d kh=%d out_nans=%d v_rms=%.6f k_rms=%.6f q_rms=%.6f S_rms=%.6f delta_rms=%.6f g=%.6f bg=%.6f\n",
+                                vh, kh, nc,
+                                sqrtf(v_h[0]*v_h[0]+v_h[1]*v_h[1]+v_h[2]*v_h[2]+v_h[3]*v_h[3])/2,
+                                sqrtf(k_h[0]*k_h[0]+k_h[1]*k_h[1]+k_h[2]*k_h[2]+k_h[3]*k_h[3])/2,
+                                sqrtf(q_h[0]*q_h[0]+q_h[1]*q_h[1]+q_h[2]*q_h[2]+q_h[3]*q_h[3])/2,
+                                sqrtf(sr/(LINEAR_VALUE_DIM*LINEAR_KEY_DIM)),
+                                sqrtf(delta_vec[0]*delta_vec[0]+delta_vec[1]*delta_vec[1]+delta_vec[2]*delta_vec[2]+delta_vec[3]*delta_vec[3])/2,
+                                g, b_gate);
+                        }
+                    }
                 }
             }
 
@@ -4915,6 +5105,20 @@ static void fused_layer_forward(
             uint16_t *gated_norm_w = lc->gated_norm_w;
             float *gated_out = s_gated_out;
             memset(gated_out, 0, LINEAR_TOTAL_VALUE * sizeof(float));
+            // [MXFP8 DEBUG] before gated norm
+            if (g_use_mxfp8 && layer_idx < 2) {
+                // Debug conv_out and lin_v
+                {int nc=0; for(int i=0;i<LINEAR_TOTAL_VALUE;i++) if(isnan(lin_v[i])) nc++;
+                float r=0; for(int i=0;i<LINEAR_TOTAL_VALUE;i++) r+=lin_v[i]*lin_v[i];
+                fprintf(stderr,"[DBG] L%d lin_v rms=%.6f nans=%d first3=[%.6f,%.6f,%.6f]\n",layer_idx,sqrtf(r/LINEAR_TOTAL_VALUE),nc,lin_v[0],lin_v[1],lin_v[2]);}
+                // Debug SSM state
+                {int nc=0; for(int i=0;i<LINEAR_NUM_V_HEADS*LINEAR_VALUE_DIM*LINEAR_KEY_DIM;i++) if(isnan(la_state->ssm_state[i])) nc++;
+                fprintf(stderr,"[DBG] L%d ssm_state nans=%d first3=[%.6f,%.6f,%.6f]\n",layer_idx,nc,la_state->ssm_state[0],la_state->ssm_state[1],la_state->ssm_state[2]);}
+                int nan_count=0; for(int i=0;i<LINEAR_TOTAL_VALUE;i++) if(isnan(out_values[i])) nan_count++;
+                {float r=0; for(int i=0;i<LINEAR_VALUE_DIM;i++) r+=out_values[i]*out_values[i]; fprintf(stderr,"[DBG] L%d out_vals vh0 rms=%.6f nans=%d\n",layer_idx,sqrtf(r/LINEAR_VALUE_DIM),nan_count);}
+                {float r=0; for(int i=0;i<LINEAR_VALUE_DIM;i++) r+=z_out[i]*z_out[i]; fprintf(stderr,"[DBG] L%d z_out vh0 rms=%.6f\n",layer_idx,sqrtf(r/LINEAR_VALUE_DIM));}
+                fprintf(stderr,"[DBG] L%d g_decay[0]=%.6f beta_gate[0]=%.6f\n",layer_idx,g_decay[0],beta_gate_arr[0]);
+            }
             for (int vh = 0; vh < LINEAR_NUM_V_HEADS; vh++) {
                 float *oh = out_values + vh * LINEAR_VALUE_DIM;
                 float *zh = z_out + vh * LINEAR_VALUE_DIM;
@@ -4927,6 +5131,11 @@ static void fused_layer_forward(
             }
 
             attn_out_for_oproj = gated_out;
+
+            // [MXFP8 DEBUG]
+            if (g_use_mxfp8 && layer_idx < 2) {
+                {float r=0; for(int i=0;i<LINEAR_TOTAL_VALUE;i++) r+=gated_out[i]*gated_out[i]; fprintf(stderr,"[DBG] L%d gated_out rms=%.4f first5=[%.4f,%.4f,%.4f,%.4f,%.4f]\n",layer_idx,sqrtf(r/LINEAR_TOTAL_VALUE),gated_out[0],gated_out[1],gated_out[2],gated_out[3],gated_out[4]);}
+            }
 
             // conv_out, out_values are static — no free needed
             // gated_out is static — freed/released after CMD2 submission below
@@ -4963,8 +5172,8 @@ static void fused_layer_forward(
     memset(shared_up, 0, SHARED_INTERMEDIATE * sizeof(float));
     float shared_gate_score = 0.0f;
 
-    int have_moe_weights = (gate_w && gate_s && gate_b && sgw && sgs && sgb &&
-                            suw && sus && sub && seg_w && seg_s && seg_b);
+    int have_moe_weights = (gate_w && gate_s && sgw && sgs &&
+                            suw && sus && seg_w && seg_s);
 
     // gpu_attn_fuse: attention dispatches fused into CMD2 (full-attn layers only).
     // Only enabled when seq_len >= 32 — below that, CPU attention is faster
@@ -4972,10 +5181,10 @@ static void fused_layer_forward(
     int gpu_attn_fuse = (is_full && !attn_out_for_oproj && g_metal && g_metal->attn_scores_pipe
                          && kv && kv->len >= 32 && kv->len < GPU_KV_SEQ);
 
-    if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w && oproj_s && oproj_b &&
+    if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w && oproj_s &&
         g_metal && g_metal->wf_buf && have_moe_weights &&
         g_metal->residual_add && g_metal->rms_norm_sum &&
-        g_metal->rms_norm_apply_bf16 && lc->post_attn_norm_w) {
+        g_metal->rms_norm_apply_bf16 && lc->post_attn_norm_w && !g_use_mxfp8) {
         // ---- FULLY FUSED CMD2 ----
         // For GPU attention (full-attn layers): attention dispatches are prepended,
         //   o_proj reads from buf_attn_out instead of batch_out[6].
@@ -5187,9 +5396,15 @@ static void fused_layer_forward(
     } else {
         // ---- Non-fused fallback path ----
         // O projection
-        if (attn_out_for_oproj && oproj_w && oproj_s && oproj_b) {
+        if (attn_out_for_oproj && oproj_w && oproj_s) {
+            if (g_use_mxfp8 && layer_idx < 2) {
+                {float r=0; for(int i=0;i<oproj_in_dim;i++) r+=((float*)attn_out_for_oproj)[i]*((float*)attn_out_for_oproj)[i]; fprintf(stderr,"[DBG] L%d oproj INPUT rms=%.6f first3=[%.6f,%.6f,%.6f]\n",layer_idx,sqrtf(r/oproj_in_dim),((float*)attn_out_for_oproj)[0],((float*)attn_out_for_oproj)[1],((float*)attn_out_for_oproj)[2]);}
+            }
             fast_dequant_matvec(oproj_w, oproj_s, oproj_b, attn_out_for_oproj,
                                 attn_projected, HIDDEN_DIM, oproj_in_dim, GROUP_SIZE);
+            if (g_use_mxfp8 && layer_idx < 2) {
+                {float r=0; int nanc=0; for(int i=0;i<HIDDEN_DIM;i++){r+=attn_projected[i]*attn_projected[i]; if(isinf(attn_projected[i]))nanc++;} fprintf(stderr,"[DBG] L%d oproj OUTPUT rms=%.6f infs=%d first3=[%.6f,%.6f,%.6f]\n",layer_idx,sqrtf(r/HIDDEN_DIM),nanc,attn_projected[0],attn_projected[1],attn_projected[2]);}
+            }
         }
         attn_out_for_oproj = NULL;
 
@@ -5212,6 +5427,13 @@ static void fused_layer_forward(
                 { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            HIDDEN_DIM, GROUP_SIZE, 3 },
             };
             fast_batch_matvec(h_post, HIDDEN_DIM, moe_specs, 4);
+        }
+        if (g_use_mxfp8 && layer_idx < 2) {
+            {float r=0; for(int i=0;i<HIDDEN_DIM;i++) r+=attn_projected[i]*attn_projected[i]; fprintf(stderr,"[DBG] L%d oproj rms=%.4f\n",layer_idx,sqrtf(r/HIDDEN_DIM));}
+            {float r=0; for(int i=0;i<HIDDEN_DIM;i++) r+=h_mid[i]*h_mid[i]; fprintf(stderr,"[DBG] L%d h_mid rms=%.4f\n",layer_idx,sqrtf(r/HIDDEN_DIM));}
+            {float r=0; for(int i=0;i<HIDDEN_DIM;i++) r+=h_post[i]*h_post[i]; fprintf(stderr,"[DBG] L%d h_post rms=%.4f\n",layer_idx,sqrtf(r/HIDDEN_DIM));}
+            {float r=0; for(int i=0;i<NUM_EXPERTS;i++) r+=gate_scores[i]*gate_scores[i]; fprintf(stderr,"[DBG] L%d gate rms=%.4f top3=[%.3f,%.3f,%.3f]\n",layer_idx,sqrtf(r/NUM_EXPERTS),gate_scores[0],gate_scores[1],gate_scores[2]);}
+            fprintf(stderr,"[DBG] L%d shared_gate_score=%.4f shared_gate rms=%.4f\n",layer_idx,shared_gate_score,sqrtf(cblas_sdot(SHARED_INTERMEDIATE,shared_gate,1,shared_gate,1)/SHARED_INTERMEDIATE));
         }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_encode += t1 - t0; }
     }
@@ -5258,7 +5480,7 @@ static void fused_layer_forward(
     int actual_K = (K > MAX_K) ? MAX_K : K;
 
 
-    if (packed_fd >= 0 && g_metal && g_metal->buf_multi_expert_data[0]) {
+    if (packed_fd >= 0 && g_metal && g_metal->buf_multi_expert_data[0] && !g_use_mxfp8) {
         // GPU multi-expert path with LRU cache + parallel I/O:
         // For each expert:
         //   - Cache HIT:  dispatch directly from cached Metal buffer (skip pread)
@@ -5549,6 +5771,8 @@ static void fused_layer_forward(
 
     } else if (packed_fd >= 0) {
         // CPU fallback for experts
+        static int fb_count = 0;
+        if (fb_count < 3) { fprintf(stderr, "[MXFB] CPU expert fallback layer=%d K=%d mxfp8=%d esz=%zu\n", layer_idx, K, g_use_mxfp8, active_expert_size()); fb_count++; }
         size_t esz = active_expert_size();
         float *expert_out_cpu = malloc(HIDDEN_DIM * sizeof(float));
         for (int k = 0; k < K; k++) {
@@ -5563,28 +5787,47 @@ static void fused_layer_forward(
                 continue;
             }
 
-            // CPU fallback offsets — use 4-bit layout (2-bit CPU path not yet implemented)
+            // CPU fallback offsets
             uint32_t *gw = (uint32_t *)expert_data;
             uint16_t *gs_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(GATE_S)));
-            uint16_t *gb_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(GATE_B)));
+            uint16_t *gb_p = g_use_mxfp8 ? NULL : (uint16_t *)((char *)expert_data + (EXPERT_OFF(GATE_B)));
             uint32_t *uw = (uint32_t *)((char *)expert_data + (EXPERT_OFF(UP_W)));
             uint16_t *us_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(UP_S)));
-            uint16_t *ub_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(UP_B)));
+            uint16_t *ub_p = g_use_mxfp8 ? NULL : (uint16_t *)((char *)expert_data + (EXPERT_OFF(UP_B)));
             uint32_t *dw = (uint32_t *)((char *)expert_data + (EXPERT_OFF(DOWN_W)));
             uint16_t *ds_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(DOWN_S)));
-            uint16_t *db_p = (uint16_t *)((char *)expert_data + (EXPERT_OFF(DOWN_B)));
+            uint16_t *db_p = g_use_mxfp8 ? NULL : (uint16_t *)((char *)expert_data + (EXPERT_OFF(DOWN_B)));
 
             float *gate_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
             float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
             float *act_out = malloc(MOE_INTERMEDIATE * sizeof(float));
 
-            dispatch_dequant_matvec(gw, gs_p, gb_p, h_post, gate_proj_out,
+            fast_dequant_matvec(gw, gs_p, gb_p, h_post, gate_proj_out,
                                MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
-            dispatch_dequant_matvec(uw, us_p, ub_p, h_post, up_proj_out,
+            fast_dequant_matvec(uw, us_p, ub_p, h_post, up_proj_out,
                                MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
+            // Clamp before SwiGLU to prevent inf/NaN propagation
+            for (int i = 0; i < MOE_INTERMEDIATE; i++) {
+                if (!isfinite(gate_proj_out[i])) gate_proj_out[i] = 0.0f;
+                if (!isfinite(up_proj_out[i])) up_proj_out[i] = 0.0f;
+            }
             cpu_swiglu(gate_proj_out, up_proj_out, act_out, MOE_INTERMEDIATE);
-            dispatch_dequant_matvec(dw, ds_p, db_p, act_out, expert_out_cpu,
+            // Clamp SwiGLU output too
+            for (int i = 0; i < MOE_INTERMEDIATE; i++) {
+                if (!isfinite(act_out[i])) act_out[i] = 0.0f;
+            }
+            fast_dequant_matvec(dw, ds_p, db_p, act_out, expert_out_cpu,
                                HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE);
+
+            // Debug: first 2 layers, first expert
+            if (layer_idx < 2 && k == 0) {
+                float gate_rms=0, up_rms=0, act_rms=0, expert_rms=0;
+                for(int i=0;i<MOE_INTERMEDIATE;i++){gate_rms+=gate_proj_out[i]*gate_proj_out[i]; up_rms+=up_proj_out[i]*up_proj_out[i]; act_rms+=act_out[i]*act_out[i];}
+                for(int i=0;i<HIDDEN_DIM;i++) expert_rms+=expert_out_cpu[i]*expert_out_cpu[i];
+                fprintf(stderr, "[MXEXP] L%d e%d gate_rms=%.4f up_rms=%.4f act_rms=%.4f expert_rms=%.4f weight=%.4f\n",
+                    layer_idx, eidx, sqrtf(gate_rms/MOE_INTERMEDIATE), sqrtf(up_rms/MOE_INTERMEDIATE),
+                    sqrtf(act_rms/MOE_INTERMEDIATE), sqrtf(expert_rms/HIDDEN_DIM), expert_weights[k]);
+            }
 
             free(gate_proj_out);
             free(up_proj_out);
@@ -5598,8 +5841,14 @@ static void fused_layer_forward(
         // CPU shared expert
         float *shared_act = calloc(SHARED_INTERMEDIATE, sizeof(float));
         cpu_swiglu(shared_gate, shared_up, shared_act, SHARED_INTERMEDIATE);
-        if (sdw && sds && sdb) {
-            dispatch_dequant_matvec(sdw, sds, sdb, shared_act, shared_out,
+        if (g_use_mxfp8) {
+            // MXFP8: shared down_proj has no biases — pass NULL
+            if (sdw && sds) {
+                fast_dequant_matvec(sdw, sds, NULL, shared_act, shared_out,
+                                   HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
+            }
+        } else if (sdw && sds && sdb) {
+            fast_dequant_matvec(sdw, sds, sdb, shared_act, shared_out,
                                HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
         }
         free(shared_act);
@@ -5621,9 +5870,13 @@ static void fused_layer_forward(
     }
 
     // ---- Final combine: hidden = h_mid + moe_out + shared_out ----
+    float rms = 0;
     for (int i = 0; i < HIDDEN_DIM; i++) {
         hidden[i] = h_mid[i] + moe_out[i] + shared_out[i];
+        rms += hidden[i] * hidden[i];
     }
+    rms = sqrtf(rms / HIDDEN_DIM);
+    fprintf(stderr, "[debug] layer %d hidden rms=%.4f\n", layer_idx, rms);
 
 
     if (g_timing_enabled) {
@@ -6901,7 +7154,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < NUM_LAYERS; i++) {
             char path[1024];
             snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin", model_path,
-                     g_use_2bit ? "packed_experts_2bit" : (g_use_8bit ? "packed_experts_8bit" : "packed_experts"), i);
+                     g_use_2bit ? "packed_experts_2bit" : (g_use_mxfp8 ? "packed_experts_mxfp8" : (g_use_8bit ? "packed_experts_8bit" : "packed_experts")), i);
             layer_fds[i] = open(path, O_RDONLY);
             layer_fds_cold[i] = -1;  // no longer used (trust OS page cache)
             layer_mmaps[i] = MAP_FAILED;

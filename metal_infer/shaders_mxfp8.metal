@@ -10,7 +10,8 @@
  * Dequantization:
  *   value_fp32 = e4m3_to_fp32(weight_byte) * e8m0_to_fp32(scale_byte)
  *
- * E8M0 format: sign(1) + exponent(7), value = (-1)^sign * 2^(exp - 127)
+ * E8M0 format: exponent(8), no sign, no mantissa
+ *   value = 2^(exponent - 127)
  *   Special: 0xFF = NaN, 0x7F = 1.0
  *
  * Author: Phoenix (for Tuan Andre / Panglima Ekspres)
@@ -29,10 +30,8 @@ static inline float e4m3_to_f32(uint8_t v) {
 
     if (exponent == 0 && mantissa == 0) return 0.0f;
 
-    // NaN: exp=15, mantissa=7
-    if (exponent == 15 && mantissa == 7) {
-        return sign ? as_type<float>(0xFFC00000u) : as_type<float>(0x7FC00000u);
-    }
+    // NaN in E4M3 — return 0 instead of NaN to prevent propagation
+    if (exponent == 15 && mantissa == 7) return 0.0f;
 
     if (exponent == 0) {
         // Subnormal E4M3
@@ -53,14 +52,14 @@ static inline float e4m3_to_f32(uint8_t v) {
 // value = (-1)^sign * 2^(exp - 127)
 // Special: 0xFF = NaN
 static inline float e8m0_to_f32(uint8_t b) {
-    if (b == 0xFF) return as_type<float>(0x7FC00000u); // NaN
+    if (b == 0x00) return 0.0f;
+    // Clamp to avoid float32 overflow when multiplied by E4M3 (max 448)
+    // 0xFF is formally NaN in E8M0, but some models use it — clamp it too.
+    if (b > 242) b = 242;  // 2^(242-127)=2^115 ≈ 4.15e34
 
-    uint sign = (b >> 7) & 1;
-    uint exp7 = b & 0x7F;
-
-    // Build FP32: 2^(exp7 - 127)
-    // FP32 bias = 127, so FP32 exponent = exp7
-    uint32_t bits = (sign << 31) | (exp7 << 23);
+    // E8M0: 8-bit exponent, no sign, no mantissa
+    // value = 2^(b - 127) => FP32 with exponent = b, mantissa = 0
+    uint32_t bits = ((uint32_t)b) << 23;
     return as_type<float>(bits);
 }
 
