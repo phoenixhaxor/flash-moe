@@ -252,7 +252,7 @@ static void qkv_cache_free(QuantizedKVCache *c) {
     }
 }
 
-// Store one K or V vector into quantized cache
+// Store one K or V vector into quantized cache (with Hadamard rotation)
 static void qkv_store(QuantizedKVCache *c, const float *vec) {
     if (c->len >= KV_MAX_SEQ) return;
 
@@ -261,13 +261,16 @@ static void qkv_store(QuantizedKVCache *c, const float *vec) {
     uint16_t *row_scales = c->scales + (size_t)row * c->scales_row_count;
     int8_t *row_zp = c->zero_points + (size_t)row * c->scales_row_count;
 
-    // Optional: apply Hadamard rotation before quantization for better quality
-    // For now, direct quantization (rotation can be enabled later)
-    quantize_4bit(vec, row_packed, row_scales, row_zp, KV_DIM);
+    // TurboQuant: apply random Hadamard rotation before quantization
+    // This concentrates values into Beta distribution, making scalar quant near-optimal
+    float rotated[KV_DIM];
+    memcpy(rotated, vec, KV_DIM * sizeof(float));
+    kv_rotate(rotated, KV_DIM);
+    quantize_4bit(rotated, row_packed, row_scales, row_zp, KV_DIM);
     c->len++;
 }
 
-// Load one K or V vector from quantized cache (into temporary buffer)
+// Load one K or V vector from quantized cache (dequantize + un-rotate)
 static void qkv_load(const QuantizedKVCache *c, int pos, float *out) {
     if (pos < 0 || pos >= c->len) {
         memset(out, 0, KV_DIM * sizeof(float));
@@ -279,6 +282,8 @@ static void qkv_load(const QuantizedKVCache *c, int pos, float *out) {
     const int8_t *row_zp = c->zero_points + (size_t)pos * c->scales_row_count;
 
     dequantize_4bit(row_packed, row_scales, row_zp, out, KV_DIM);
+    // Inverse Hadamard rotation to recover original vector
+    kv_unrotate(out, KV_DIM);
 }
 
 // ---- Hybrid KV Cache: keeps recent tokens in FP32 for precision,
