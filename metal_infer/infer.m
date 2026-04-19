@@ -62,6 +62,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include "kv_quant.h"  // TurboQuant-inspired 4-bit KV cache compression
 #include <sys/wait.h>
 
 // ============================================================================
@@ -196,6 +197,7 @@ static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think_>
 static int g_no_think = 0;       // suppress thinking tokens entirely (--no-think or request param)
 static int g_serve_workers = 1;  // number of pre-forked worker processes
+static int g_kv_quant = 0;       // quantize KV cache to 4-bit (--kv-quant)
 
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [NUM_LAYERS] cold fds (set in main)
@@ -2078,6 +2080,8 @@ typedef struct {
     float *k_cache;  // [max_seq, num_kv_heads * head_dim]
     float *v_cache;  // [max_seq, num_kv_heads * head_dim]
     int len;         // current number of cached entries
+    // ---- Quantized KV cache (optional, enabled by --kv-quant) ----
+    HybridKVCache *hybrid;  // non-NULL when quantization enabled
 } KVCache;
 
 static KVCache *kv_cache_new(void) {
@@ -2085,6 +2089,10 @@ static KVCache *kv_cache_new(void) {
     c->k_cache = calloc(MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM, sizeof(float));
     c->v_cache = calloc(MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM, sizeof(float));
     c->len = 0;
+    c->hybrid = NULL;
+    if (g_kv_quant) {
+        c->hybrid = hybrid_kv_new();
+    }
     return c;
 }
 
@@ -2092,6 +2100,7 @@ static void kv_cache_free(KVCache *c) {
     if (c) {
         free(c->k_cache);
         free(c->v_cache);
+        if (c->hybrid) hybrid_kv_free(c->hybrid);
         free(c);
     }
 }
@@ -2274,6 +2283,10 @@ static void full_attention_forward(
     memcpy(kv->k_cache + cache_pos * kv_dim, k, kv_dim * sizeof(float));
     memcpy(kv->v_cache + cache_pos * kv_dim, v, kv_dim * sizeof(float));
     kv->len++;
+    // Also store into hybrid quantized cache if enabled
+    if (kv->hybrid) {
+        hybrid_kv_store(kv->hybrid, k, v);
+    }
 
     // ---- Scaled dot-product attention ----
     // GQA: NUM_ATTN_HEADS=32 heads, NUM_KV_HEADS=2 kv heads
@@ -6376,6 +6389,7 @@ static void print_usage(const char *prog) {
     printf("  --think-budget N     Max thinking tokens before force </think_> (default: 2048, 0=unlimited)\n");
     printf("  --no-think           Disable thinking mode entirely (suppress <think_> tokens)\n");
     printf("  --serve-workers N    Pre-fork N worker processes for concurrent requests (default: 1)\n");
+    printf("  --kv-quant           Quantize KV cache to 4-bit (8x memory reduction)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
     printf("  --help               This message\n");
 }
@@ -6416,13 +6430,14 @@ int main(int argc, char **argv) {
             {"think-budget",  required_argument, 0, 'B'},
             {"no-think",      no_argument,       0, 'N'},
             {"serve-workers", required_argument, 0, 'W'},
+            {"kv-quant",      no_argument,       0, 'Q'},
             {"serve",         required_argument, 0, 'R'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:W:LSTFE2GNh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:W:LSTFE2GNQh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -6445,6 +6460,7 @@ int main(int argc, char **argv) {
                 case 'B': g_think_budget = atoi(optarg); break;
                 case 'N': g_no_think = 1; break;
                 case 'W': g_serve_workers = atoi(optarg); if (g_serve_workers < 1) g_serve_workers = 1; break;
+                case 'Q': g_kv_quant = 1; break;
                 case 'R': serve_port = atoi(optarg); break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
@@ -6687,6 +6703,20 @@ int main(int argc, char **argv) {
             } else {
                 layer_states[i] = linear_attn_state_new();
             }
+        }
+
+        if (g_kv_quant) {
+            printf("[kv-quant] 4-bit KV cache compression ENABLED for %d full-attention layers\n",
+                   NUM_FULL_ATTN_LAYERS);
+            size_t fp32_per_req = (size_t)NUM_FULL_ATTN_LAYERS * 2 * KV_MAX_SEQ * KV_DIM * sizeof(float);
+            size_t q4_per_req = (size_t)NUM_FULL_ATTN_LAYERS * 2 * (
+                KV_MAX_SEQ * ((KV_DIM + 1) / 2) +   // packed
+                KV_MAX_SEQ * 8 * sizeof(uint16_t) +  // scales
+                KV_MAX_SEQ * 8 * sizeof(int8_t) +    // zero points
+                RECENT_WINDOW * KV_DIM * sizeof(float) // recent FP32 window
+            );
+            printf("[kv-quant] Per-request: %.1f MB (FP32: %.1f MB, %.1fx compression)\n",
+                   q4_per_req / 1e6, fp32_per_req / 1e6, (double)fp32_per_req / q4_per_req);
         }
 
         double t_init = now_ms();
