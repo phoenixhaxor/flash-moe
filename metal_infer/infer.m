@@ -195,6 +195,7 @@ static int g_use_8bit = 0;       // enabled by --8bit flag: use 8-bit model weig
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think_>
 static int g_no_think = 0;       // suppress thinking tokens entirely (--no-think or request param)
+static int g_serve_workers = 1;  // number of pre-forked worker processes
 
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [NUM_LAYERS] cold fds (set in main)
@@ -5823,6 +5824,10 @@ static void serve_loop(
 
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT
+    // Allow multiple workers to bind same port (pre-fork concurrency)
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
 
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
@@ -5832,11 +5837,12 @@ static void serve_loop(
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind"); close(server_fd); return;
     }
-    if (listen(server_fd, 8) < 0) {
+    int backlog = (g_serve_workers > 1) ? 32 : 8;
+    if (listen(server_fd, backlog) < 0) {
         perror("listen"); close(server_fd); return;
     }
 
-    printf("[serve] Listening on http://0.0.0.0:%d\n", port);
+    printf("[serve:pid%d] Listening on http://0.0.0.0:%d (workers=%d)\n", getpid(), port, g_serve_workers);
     printf("[serve] Endpoints: POST /v1/chat/completions, GET /v1/models, GET /health\n");
     fflush(stdout);
 
@@ -6369,6 +6375,7 @@ static void print_usage(const char *prog) {
     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
     printf("  --think-budget N     Max thinking tokens before force </think_> (default: 2048, 0=unlimited)\n");
     printf("  --no-think           Disable thinking mode entirely (suppress <think_> tokens)\n");
+    printf("  --serve-workers N    Pre-fork N worker processes for concurrent requests (default: 1)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
     printf("  --help               This message\n");
 }
@@ -6408,13 +6415,14 @@ int main(int argc, char **argv) {
             {"gpu-linear",    no_argument,       0, 'G'},
             {"think-budget",  required_argument, 0, 'B'},
             {"no-think",      no_argument,       0, 'N'},
+            {"serve-workers", required_argument, 0, 'W'},
             {"serve",         required_argument, 0, 'R'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2GNh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:W:LSTFE2GNh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -6436,6 +6444,7 @@ int main(int argc, char **argv) {
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'B': g_think_budget = atoi(optarg); break;
                 case 'N': g_no_think = 1; break;
+                case 'W': g_serve_workers = atoi(optarg); if (g_serve_workers < 1) g_serve_workers = 1; break;
                 case 'R': serve_port = atoi(optarg); break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
@@ -6472,6 +6481,32 @@ int main(int argc, char **argv) {
                          "vocab.bin");
             }
             vocab_path = default_vocab;
+        }
+
+        // ---- Pre-fork worker processes (before Metal init) ----
+        if (serve_port > 0 && g_serve_workers > 1) {
+            pid_t worker_pids[64]; // max 64 workers
+            int n_workers = g_serve_workers;
+            if (n_workers > 64) n_workers = 64;
+            
+            fprintf(stderr, "[server] Pre-forking %d worker processes on port %d\n", n_workers, serve_port);
+            
+            for (int i = 1; i < n_workers; i++) {
+                pid_t pid = fork();
+                if (pid < 0) {
+                    perror("fork");
+                    fprintf(stderr, "[server] WARNING: fork failed for worker %d, continuing with %d workers\n", i, i);
+                    break;
+                }
+                if (pid == 0) {
+                    // Child worker process
+                    fprintf(stderr, "[server:worker%d] Started (pid=%d)\n", i, getpid());
+                    break; // child falls through to Metal init + serve_loop
+                }
+                worker_pids[i] = pid;
+            }
+            // Parent (worker 0) also falls through to Metal init + serve_loop
+            // Children that broke out of loop also fall through
         }
 
         // ---- Initialize Metal ----
