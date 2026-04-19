@@ -4325,8 +4325,7 @@ static void fused_layer_forward(
     int K,                   // number of active experts
     int packed_fd            // fd for packed expert file
 ) {
-    fprintf(stderr, "[FLF] layer=%d START\n", layer_idx);
-    { float rms=0; for(int i=0;i<HIDDEN_DIM;i++) rms+=hidden[i]*hidden[i]; rms=sqrtf(rms/HIDDEN_DIM); fprintf(stderr, "[FLF] layer=%d input_rms=%.4f\n", layer_idx, rms); }
+    if(0){fprintf(stderr,"[FLF] layer=%d START\n",layer_idx);}{float rms=0;for(int i=0;i<HIDDEN_DIM;i++)rms+=hidden[i]*hidden[i];rms=sqrtf(rms/HIDDEN_DIM);if(0)fprintf(stderr,"[FLF] layer=%d input_rms=%.4f\n",layer_idx,rms);}
     double t_layer_start = 0, t0 = 0, t1 = 0;
     if (g_timing_enabled) { t_layer_start = now_ms(); }
 
@@ -4548,10 +4547,7 @@ static void fused_layer_forward(
 
 
         // Submit CMD1: attention projections
-        fprintf(stderr, "[CMD1] layer=%d normed rms=%.4f first5=[%.4f,%.4f,%.4f,%.4f,%.4f]\n",
-            layer_idx,
-            sqrtf(normed[0]*normed[0]+normed[1]*normed[1]+normed[2]*normed[2]+normed[3]*normed[3]+normed[4]*normed[4])/sqrtf(5),
-            normed[0], normed[1], normed[2], normed[3], normed[4]);
+        if(0)fprintf(stderr,"[CMD1] layer=%d normed rms=%.4f first5=[%.4f,%.4f,%.4f,%.4f,%.4f]\n",layer_idx,sqrtf(normed[0]*normed[0]+normed[1]*normed[1]+normed[2]*normed[2]+normed[3]*normed[3]+normed[4]*normed[4])/sqrtf(5),normed[0],normed[1],normed[2],normed[3],normed[4]);
         if (g_timing_enabled) { t0 = now_ms(); }
         if (g_metal && g_metal->wf_buf && num_attn_specs > 0 && !g_use_mxfp8) {
             memcpy([g_metal->buf_input contents], normed, HIDDEN_DIM * sizeof(float));
@@ -4675,8 +4671,7 @@ static void fused_layer_forward(
             int dbg_dim = 8192 + 8192 + 8192; // qkv total = LINEAR_CONV_DIM = 8192
             float rms_qkv = 0;
             for (int i = 0; i < 100; i++) rms_qkv += qkv_out[i]*qkv_out[i];
-            fprintf(stderr, "[CMD1] layer=%d qkv_out rms(100)=%.4f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
-                layer_idx, sqrtf(rms_qkv/100), qkv_out[0], qkv_out[1], qkv_out[2], qkv_out[3], qkv_out[4]);
+            if(0)fprintf(stderr,"[CMD1] layer=%d qkv_out rms(100)=%.4f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",layer_idx,sqrtf(rms_qkv/100),qkv_out[0],qkv_out[1],qkv_out[2],qkv_out[3],qkv_out[4]);
         }
     }
 
@@ -5820,7 +5815,7 @@ static void fused_layer_forward(
                                HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE);
 
             // Debug: first 2 layers, first expert
-            if (layer_idx < 2 && k == 0) {
+            if (0 && layer_idx < 2 && k == 0) {
                 float gate_rms=0, up_rms=0, act_rms=0, expert_rms=0;
                 for(int i=0;i<MOE_INTERMEDIATE;i++){gate_rms+=gate_proj_out[i]*gate_proj_out[i]; up_rms+=up_proj_out[i]*up_proj_out[i]; act_rms+=act_out[i]*act_out[i];}
                 for(int i=0;i<HIDDEN_DIM;i++) expert_rms+=expert_out_cpu[i]*expert_out_cpu[i];
@@ -5876,7 +5871,7 @@ static void fused_layer_forward(
         rms += hidden[i] * hidden[i];
     }
     rms = sqrtf(rms / HIDDEN_DIM);
-    fprintf(stderr, "[debug] layer %d hidden rms=%.4f\n", layer_idx, rms);
+    if(0)fprintf(stderr,"[debug] layer %d hidden rms=%.4f\n",layer_idx,rms);
 
 
     if (g_timing_enabled) {
@@ -7368,13 +7363,9 @@ int main(int argc, char **argv) {
                 for (int k = 1; k < 5; k++) if (topv[k] < topv[min_k]) min_k = k;
                 if (logits[i] > topv[min_k]) { topv[min_k] = logits[i]; top5[min_k] = i; }
             }
-            fprintf(stderr, "[debug] Top 5 logits (next_token=%d):\n", next_token);
-            for (int i = 0; i < 5; i++) {
-                fprintf(stderr, "  token %d (\"%s\") logit=%.4f\n",
-                        top5[i], decode_token(vocab, top5[i]), topv[i]);
+            if(0){fprintf(stderr,"[debug] Top 5 logits (next_token=%d):\n",next_token);for(int i=0;i<5;i++){fprintf(stderr,"  token %d (\"%s\") logit=%.4f\n",top5[i],decode_token(vocab,top5[i]),topv[i]);}
             }
-            fprintf(stderr, "[debug] hidden rms after final_norm=%.4f, logits rms=%.4f\n",
-                    vec_rms(hidden, HIDDEN_DIM), vec_rms(logits, VOCAB_SIZE));
+            if(0)fprintf(stderr,"[debug] hidden rms after final_norm=%.4f, logits rms=%.4f\n",vec_rms(hidden,HIDDEN_DIM),vec_rms(logits,VOCAB_SIZE));
         }
         printf("[ttft] %.0f ms (prefill %d tokens + lm_head %.0f ms)\n",
                ttft_ms, pt->count, lm_ms);
