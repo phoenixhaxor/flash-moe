@@ -146,7 +146,7 @@
 #define THINK_START_TOKEN   248068  // <think>
 #define THINK_END_TOKEN     248069  // </think>
 
-#define MODEL_PATH_DEFAULT ""  // Use --model flag to specify path
+#define MODEL_PATH_DEFAULT "."  // Default to current directory
 
 // ============================================================================
 // Timing helper
@@ -1386,7 +1386,7 @@ static void gpu_batch_matvec(
         [enc setBytes:&s->in_dim    length:4     atIndex:6];
         [enc setBytes:&s->group_size length:4    atIndex:7];
 
-        if (use_v3) {
+        if (use_v3 || g_use_8bit) {
             uint32_t num_tgs = (s->out_dim + 7) / 8;
             [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -1440,7 +1440,7 @@ static void gpu_encode_batch_matvec(
         [enc setBytes:&s->in_dim    length:4     atIndex:6];
         [enc setBytes:&s->group_size length:4    atIndex:7];
 
-        if (use_v3) {
+        if (use_v3 || g_use_8bit) {
             uint32_t num_tgs = (s->out_dim + 7) / 8;
             [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -1488,7 +1488,7 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
     [enc setBytes:&in_dim      length:4     atIndex:6];
     [enc setBytes:&group_size  length:4     atIndex:7];
 
-    if (use_v3) {
+    if (use_v3 || g_use_8bit) {
         uint32_t num_tgs = (out_dim + 7) / 8;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -3800,6 +3800,7 @@ static void finalize_deferred_experts(void) {
         for (int i = 0; i < HIDDEN_DIM; i++) {
             g_deferred.hidden[i] = g_deferred.h_mid[i] + moe_out[i] + shared_out[i];
         }
+
     }
 
     g_deferred.active = 0;
@@ -4010,7 +4011,8 @@ static void fused_layer_forward(
     // Check if previous layer's CMD3 already computed combine+residual+norm on GPU.
     // If so, buf_input already contains the normalized input for this layer's CMD1.
     // We can submit CMD1 immediately — the GPU queue serializes CMD3(N-1) then CMD1(N).
-    int prev_gpu_combined = (g_deferred.active && g_deferred.gpu_combined);
+    // FIX: For layer 0, there is no previous layer, so never use FAST PATH.
+    int prev_gpu_combined = (layer_idx > 0 && g_deferred.active && g_deferred.gpu_combined);
 
     if (prev_gpu_combined && g_metal && g_metal->wf_buf && num_attn_specs > 0) {
         // ---- FAST PATH: GPU-combined previous CMD3 ----
@@ -4151,6 +4153,7 @@ static void fused_layer_forward(
         cpu_vec_copy(residual, hidden, HIDDEN_DIM);
         cpu_rms_norm(hidden, lc->input_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
         if (g_timing_enabled) { t1 = now_ms(); g_timing.input_norm += t1 - t0; }
+
 
         // Submit CMD1: attention projections
         if (g_timing_enabled) { t0 = now_ms(); }
@@ -4815,6 +4818,7 @@ static void fused_layer_forward(
             // For GPU attention: o_proj reads from buf_attn_out
             // For CPU attention: o_proj reads from batch_out[6]
             id<MTLBuffer> oproj_input = gpu_attn_fuse ? g_metal->buf_attn_out : g_metal->batch_out[6];
+            
 
             id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
             uint32_t o_out_dim = HIDDEN_DIM;
@@ -4830,7 +4834,7 @@ static void fused_layer_forward(
             [enc setBytes:&o_in_dim   length:4 atIndex:6];
             [enc setBytes:&o_gs       length:4 atIndex:7];
             [enc dispatchThreadgroups:MTLSizeMake(o_out_dim, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc endEncoding];
         }
 
@@ -4943,11 +4947,14 @@ static void fused_layer_forward(
 
     // ---- Softmax + top-K (CPU) ----
     if (g_timing_enabled) { t0 = now_ms(); }
+
+
     cpu_softmax(gate_scores, NUM_EXPERTS);
     int expert_indices[64];
     float expert_weights[64];
     cpu_topk(gate_scores, NUM_EXPERTS, K, expert_indices, expert_weights);
     cpu_normalize_weights(expert_weights, K);
+
     if (g_freq_tracking) {
         for (int k = 0; k < K; k++) {
             g_expert_freq[layer_idx][expert_indices[k]]++;
@@ -4978,6 +4985,7 @@ static void fused_layer_forward(
     memset(shared_out, 0, HIDDEN_DIM * sizeof(float));
 
     int actual_K = (K > MAX_K) ? MAX_K : K;
+
 
     if (packed_fd >= 0 && g_metal && g_metal->buf_multi_expert_data[0]) {
         // GPU multi-expert path with LRU cache + parallel I/O:
@@ -5345,6 +5353,7 @@ static void fused_layer_forward(
     for (int i = 0; i < HIDDEN_DIM; i++) {
         hidden[i] = h_mid[i] + moe_out[i] + shared_out[i];
     }
+
 
     if (g_timing_enabled) {
         t1 = now_ms();
@@ -6699,6 +6708,7 @@ int main(int argc, char **argv) {
                 embed_lookup(wf, pt->ids[0], hidden);
             }
 
+
             for (int layer = 0; layer < NUM_LAYERS; layer++) {
                 int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
                 fused_layer_forward(wf, layer, hidden,
@@ -6707,6 +6717,7 @@ int main(int argc, char **argv) {
                                     pos,
                                     layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
                                     K, layer_fds[layer]);
+
             }
             // Full completion — need hidden state for final norm + lm_head
             complete_deferred_experts();
@@ -6727,6 +6738,7 @@ int main(int argc, char **argv) {
         double t_lm = now_ms();
         lm_head_forward(wf, hidden, logits);
         double lm_ms = now_ms() - t_lm;
+
 
         // ---- Sample first token ----
         int next_token = cpu_argmax(logits, VOCAB_SIZE);
