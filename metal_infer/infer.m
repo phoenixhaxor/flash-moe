@@ -6928,7 +6928,7 @@ int main(int argc, char **argv) {
             {"cache-telemetry", no_argument,     0, 'E'},
             {"2bit",          no_argument,       0, '2'},
             {"8bit",          no_argument,       0, '8'},
-            {"mxfp8",         no_argument,       0, 'X'},
+            // mxfp8 removed
             {"gpu-linear",    no_argument,       0, 'G'},
             {"think-budget",  required_argument, 0, 'B'},
             {"no-think",      no_argument,       0, 'N'},
@@ -6959,7 +6959,7 @@ int main(int argc, char **argv) {
                 case 'E': g_cache_telemetry_enabled = 1; break;
                 case '2': g_use_2bit = 1; break;
                 case '8': g_use_8bit = 1; break;
-                case 'X': g_use_mxfp8 = 1; g_use_8bit = 1; break;  // mxfp8 reuses 8-bit offsets/paths
+                // case 'X' removed: mxfp8 not viable (E8M0 scale overflow)
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'B': g_think_budget = atoi(optarg); break;
                 case 'N': g_no_think = 1; break;
