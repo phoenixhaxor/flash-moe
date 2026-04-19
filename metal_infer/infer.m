@@ -81,7 +81,9 @@
 #define MOE_INTERMEDIATE    512
 #define SHARED_INTERMEDIATE 512
 #define FULL_ATTN_INTERVAL  4
-#define GROUP_SIZE          64
+#define GROUP_SIZE_8BIT      64
+#define GROUP_SIZE_MXFP8     32
+#define GROUP_SIZE           (g_use_mxfp8 ? GROUP_SIZE_MXFP8 : GROUP_SIZE_8BIT)
 #define BITS                4
 
 // Linear attention (GatedDeltaNet) constants
@@ -193,6 +195,13 @@ static int g_expert_freq[NUM_LAYERS][NUM_EXPERTS];  // activation count per (lay
 static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
 static int g_use_8bit = 0;       // enabled by --8bit flag: use 8-bit model weights + 8-bit kernel
+static int g_use_mxfp8 = 0;     // enabled by --mxfp8 flag: FP8 E4M3 weights, no biases, group_size=32
+
+// Forward declarations for dispatch_dequant_matvec
+static void cpu_dequant_matvec(const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+    const float *x, float *out, int out_dim, int in_dim, int group_size);
+static void cpu_dequant_matvec_mxfp8(const uint32_t *W, const uint16_t *scales,
+    const float *x, float *out, int out_dim, int in_dim, int group_size);
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think_>
 static int g_no_think = 0;       // suppress thinking tokens entirely (--no-think or request param)
@@ -218,11 +227,25 @@ static inline int expert_pick_fd(int layer, int expert, int warm_fd) {
 }
 
 // Expert offset helper: selects 2-bit, 8-bit, or 4-bit offset
-#define EXPERT_OFF(name) (g_use_2bit ? name##_OFF_2 : (g_use_8bit ? name##_OFF_8 : name##_OFF_4))
+#define EXPERT_OFF(name) (g_use_2bit ? name##_OFF_2 : (g_use_8bit || g_use_mxfp8 ? name##_OFF_8 : name##_OFF_4))
 
+// Expert size/offset constants untuk mxfp8 (IDENTIK dengan 8-bit!)
 // Active expert size based on quantization mode
 static inline size_t active_expert_size(void) {
-    return g_use_2bit ? EXPERT_SIZE_2BIT : (g_use_8bit ? EXPERT_SIZE_8BIT : EXPERT_SIZE);
+    return g_use_2bit ? EXPERT_SIZE_2BIT : ((g_use_8bit || g_use_mxfp8) ? EXPERT_SIZE_8BIT : EXPERT_SIZE);
+}
+
+// Dispatch dequant matvec: picks mxfp8 or affine path based on flags
+static inline void dispatch_dequant_matvec(
+    const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+    const float *x, float *out,
+    int out_dim, int in_dim, int group_size
+) {
+    if (g_use_mxfp8) {
+        cpu_dequant_matvec_mxfp8(W, scales, x, out, out_dim, in_dim, group_size);
+    } else {
+        cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
+    }
 }
 static int g_freq_total_tokens = 0;  // total tokens processed while tracking
 
@@ -736,6 +759,77 @@ static void cpu_dequant_matvec(
     }
 }
 
+// ============================================================================
+// FP8 E4M3 to FP32 conversion for MXFP8 format
+// ============================================================================
+// E4M3: 1 sign + 4 exponent (bias=7) + 3 mantissa
+// Range: ±[2^-6 * 0.125, 2^9 * 1.875] = ±[0.001953125, 960]
+// No infinity — only NaN (exp=15, mantissa=7)
+static inline float e4m3_to_f32(uint8_t v) {
+    uint32_t sign = (v >> 7) & 1;
+    uint32_t exponent = (v >> 3) & 0xF;
+    uint32_t mantissa = v & 0x7;
+    
+    if (exponent == 0 && mantissa == 0) return 0.0f;
+    
+    // NaN
+    if (exponent == 15 && mantissa == 7) {
+        uint32_t nan_bits = sign ? 0xFFC00000u : 0x7FC00000u;
+        float r; memcpy(&r, &nan_bits, 4); return r;
+    }
+    
+    // Normal: value = (-1)^sign * 2^(exp-7) * (1 + mant/8)
+    int fp32_exp = (int)exponent - 7 + 127;
+    uint32_t bits;
+    if (exponent == 0) {
+        // Subnormal: no implicit 1, adjust exponent
+        fp32_exp = 120; // 127 - 7
+        bits = (sign << 31) | (fp32_exp << 23) | (mantissa << 20);
+        // Compensate for missing implicit bit and correct range
+        float r; memcpy(&r, &bits, 4);
+        return r * 0.5f;  // subnormal adjustment
+    }
+    bits = (sign << 31) | ((uint32_t)fp32_exp << 23) | (mantissa << 20);
+    float r; memcpy(&r, &bits, 4);
+    return r;
+}
+
+// MXFP8 dequant matvec: out[out_dim] = W * x[in_dim]
+// Weights are FP8 E4M3 packed 4-per-uint32, scales only (no biases), group_size=32
+static void cpu_dequant_matvec_mxfp8(
+    const uint32_t *W, const uint16_t *scales,
+    const float *x, float *out,
+    int out_dim, int in_dim, int group_size
+) {
+    int num_groups = in_dim / group_size;
+    int packed_cols = in_dim / 4;  // 4 FP8 values per uint32
+    int packed_per_group = group_size / 4;
+    
+    for (int row = 0; row < out_dim; row++) {
+        float acc = 0.0f;
+        const uint32_t *w_row = W + row * packed_cols;
+        const uint16_t *s_row = scales + row * num_groups;
+        
+        for (int g = 0; g < num_groups; g++) {
+            float scale = bf16_to_f32(s_row[g]);
+            int base_packed = g * packed_per_group;
+            int base_x = g * group_size;
+            
+            for (int p = 0; p < packed_per_group; p++) {
+                uint32_t packed = w_row[base_packed + p];
+                int x_base = base_x + p * 4;
+                
+                // Extract 4 FP8 E4M3 values, convert, multiply by scale (no bias!)
+                acc += e4m3_to_f32((packed >>  0) & 0xFF) * scale * x[x_base + 0];
+                acc += e4m3_to_f32((packed >>  8) & 0xFF) * scale * x[x_base + 1];
+                acc += e4m3_to_f32((packed >> 16) & 0xFF) * scale * x[x_base + 2];
+                acc += e4m3_to_f32((packed >> 24) & 0xFF) * scale * x[x_base + 3];
+            }
+        }
+        out[row] = acc;
+    }
+}
+
 // RMS normalization: out = x * w / rms(x)
 static void cpu_rms_norm(const float *x, const uint16_t *w_bf16, float *out, int dim, float eps) {
     float sum_sq = 0.0f;
@@ -1059,6 +1153,41 @@ static MetalCtx *metal_setup(void) {
         ctx->matvec_fast = ctx->matvec_v3;  // fast path also uses 8-bit
         printf("[metal] 8-bit mode: using dequant_matvec_8bit for all projections\n");
     }
+    
+    // If MXFP8 mode: load mxfp8 shader and swap pipeline
+    if (g_use_mxfp8) {
+        // Load additional MXFP8 shader source
+        NSArray *mxfp8_paths = @[@"shaders_mxfp8.metal", @"metal_infer/shaders_mxfp8.metal"];
+        NSString *mxfp8_src = nil;
+        for (NSString *p in mxfp8_paths) {
+            mxfp8_src = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+            if (mxfp8_src) break;
+        }
+        if (mxfp8_src) {
+            // Recompile library with both shaders
+            NSString *combined = [NSString stringWithFormat:@"%@\n%@", src, mxfp8_src];
+            ctx->library = [ctx->device newLibraryWithSource:combined options:opts error:&error];
+            if (!ctx->library) {
+                fprintf(stderr, "ERROR: MXFP8 shader compile failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+            } else {
+                // Re-create makePipe block with new library
+                id<MTLComputePipelineState> (^makePipe2)(NSString *) = ^(NSString *name) {
+                    id<MTLFunction> fn = [ctx->library newFunctionWithName:name];
+                    if (!fn) { fprintf(stderr, "ERROR: shader '%s' not found\n", [name UTF8String]); return (id<MTLComputePipelineState>)nil; }
+                    NSError *e3 = nil;
+                    id<MTLComputePipelineState> ps = [ctx->device newComputePipelineStateWithFunction:fn error:&e3];
+                    if (!ps) { fprintf(stderr, "ERROR: pipeline '%s': %s\n", [name UTF8String], [[e3 localizedDescription] UTF8String]); }
+                    return ps;
+                };
+                ctx->matvec_v3   = makePipe2(@"dequant_matvec_mxfp8");
+                ctx->matvec_fast = ctx->matvec_v3;
+                printf("[metal] MXFP8 mode: using dequant_matvec_mxfp8 for all projections\n");
+            }
+        } else {
+            fprintf(stderr, "WARNING: shaders_mxfp8.metal not found, falling back to CPU mxfp8 path\n");
+        }
+    }
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
     ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
@@ -1345,7 +1474,7 @@ static void fast_dequant_matvec(
         gpu_dequant_matvec(g_metal, W, scales, biases, x, out,
                            (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size);
     } else {
-        cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
+        dispatch_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
     }
 }
 
@@ -1900,7 +2029,7 @@ static void fast_batch_matvec(
     } else {
         for (int i = 0; i < num_specs; i++) {
             BatchMatvecSpec *s = &specs[i];
-            cpu_dequant_matvec(s->W, s->scales, s->biases, x, s->out_cpu,
+            dispatch_dequant_matvec(s->W, s->scales, s->biases, x, s->out_cpu,
                                s->out_dim, s->in_dim, s->group_size);
         }
     }
@@ -2817,12 +2946,12 @@ static void moe_forward(
                 float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
                 float *act_out = malloc(MOE_INTERMEDIATE * sizeof(float));
 
-                cpu_dequant_matvec(gw, gs_p, gb_p, h_post, gate_proj_out,
+                dispatch_dequant_matvec(gw, gs_p, gb_p, h_post, gate_proj_out,
                                    MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
-                cpu_dequant_matvec(uw, us_p, ub_p, h_post, up_proj_out,
+                dispatch_dequant_matvec(uw, us_p, ub_p, h_post, up_proj_out,
                                    MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
                 cpu_swiglu(gate_proj_out, up_proj_out, act_out, MOE_INTERMEDIATE);
-                cpu_dequant_matvec(dw, ds_p, db_p, act_out, expert_out,
+                dispatch_dequant_matvec(dw, ds_p, db_p, act_out, expert_out,
                                    HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE);
 
                 free(gate_proj_out);
@@ -4302,7 +4431,7 @@ static void fused_layer_forward(
         } else {
             for (int i = 0; i < num_attn_specs; i++) {
                 BatchMatvecSpec *s = &attn_specs[i];
-                cpu_dequant_matvec(s->W, s->scales, s->biases, normed, s->out_cpu,
+                dispatch_dequant_matvec(s->W, s->scales, s->biases, normed, s->out_cpu,
                                    s->out_dim, s->in_dim, s->group_size);
             }
         }
@@ -4342,7 +4471,7 @@ static void fused_layer_forward(
         memset(spec_scores, 0, NUM_EXPERTS * sizeof(float));
 
         // Gate projection matvec on pre-attention normed input (CPU, ~0.1ms for 512x4096)
-        cpu_dequant_matvec(lc->gate_w, lc->gate_s, lc->gate_b,
+        dispatch_dequant_matvec(lc->gate_w, lc->gate_s, lc->gate_b,
                            normed, spec_scores,
                            NUM_EXPERTS, HIDDEN_DIM, GROUP_SIZE);
         cpu_softmax(spec_scores, NUM_EXPERTS);
@@ -5373,12 +5502,12 @@ static void fused_layer_forward(
             float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
             float *act_out = malloc(MOE_INTERMEDIATE * sizeof(float));
 
-            cpu_dequant_matvec(gw, gs_p, gb_p, h_post, gate_proj_out,
+            dispatch_dequant_matvec(gw, gs_p, gb_p, h_post, gate_proj_out,
                                MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
-            cpu_dequant_matvec(uw, us_p, ub_p, h_post, up_proj_out,
+            dispatch_dequant_matvec(uw, us_p, ub_p, h_post, up_proj_out,
                                MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
             cpu_swiglu(gate_proj_out, up_proj_out, act_out, MOE_INTERMEDIATE);
-            cpu_dequant_matvec(dw, ds_p, db_p, act_out, expert_out_cpu,
+            dispatch_dequant_matvec(dw, ds_p, db_p, act_out, expert_out_cpu,
                                HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE);
 
             free(gate_proj_out);
@@ -5394,7 +5523,7 @@ static void fused_layer_forward(
         float *shared_act = calloc(SHARED_INTERMEDIATE, sizeof(float));
         cpu_swiglu(shared_gate, shared_up, shared_act, SHARED_INTERMEDIATE);
         if (sdw && sds && sdb) {
-            cpu_dequant_matvec(sdw, sds, sdb, shared_act, shared_out,
+            dispatch_dequant_matvec(sdw, sds, sdb, shared_act, shared_out,
                                HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
         }
         free(shared_act);
@@ -6470,6 +6599,7 @@ int main(int argc, char **argv) {
             {"cache-telemetry", no_argument,     0, 'E'},
             {"2bit",          no_argument,       0, '2'},
             {"8bit",          no_argument,       0, '8'},
+            {"mxfp8",         no_argument,       0, 'X'},
             {"gpu-linear",    no_argument,       0, 'G'},
             {"think-budget",  required_argument, 0, 'B'},
             {"no-think",      no_argument,       0, 'N'},
@@ -6481,7 +6611,7 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:W:LSTFE2GNQh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:W:LSTFE2XGNQh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -6500,6 +6630,7 @@ int main(int argc, char **argv) {
                 case 'E': g_cache_telemetry_enabled = 1; break;
                 case '2': g_use_2bit = 1; break;
                 case '8': g_use_8bit = 1; break;
+                case 'X': g_use_mxfp8 = 1; g_use_8bit = 1; break;  // mxfp8 reuses 8-bit offsets/paths
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'B': g_think_budget = atoi(optarg); break;
                 case 'N': g_no_think = 1; break;
