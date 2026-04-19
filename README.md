@@ -11,6 +11,8 @@ Pure C/Metal inference engine that streams Qwen3.5/Qwen3.6 Mixture-of-Experts mo
 - Expert weights (the bulk of the model) stream from NVMe SSD per token via parallel `pread()`
 - Non-expert weights (embedding, attention, norms) stay resident in RAM (~3-5 GB)
 - Custom 2-bit expert quantization cuts disk footprint by ~44% and nearly doubles throughput
+- **4-bit KV cache quantization** (TurboQuant-inspired) — 6.9× memory reduction with quality preserved
+- **Multi-worker serving** — pre-fork N workers for concurrent requests with no queueing
 - OpenAI-compatible HTTP server mode for drop-in integration
 
 ## Supported Models
@@ -147,7 +149,68 @@ Key flags:
 | `--model PATH` | Model directory path (default: current directory) |
 | `--serve PORT` | Start OpenAI-compatible HTTP server on PORT |
 | `--timing` | Print per-layer timing breakdown |
-| `--think-budget N` | Max thinking tokens before forcing `</think>` (default: 2048) |
+| `--think-budget N` | Max thinking tokens before forcing ``` (default: 2048) |
+| `--no-think` | Disable thinking mode entirely (suppress `<think_>` tokens) |
+| `--kv-quant` | Quantize KV cache to 4-bit (**6.9× memory reduction**, quality preserved) |
+| `--serve-workers N` | Pre-fork N worker processes for concurrent request serving (default: 1) |
+
+## 4-bit KV Cache Quantization
+
+Inspired by Google Research's **TurboQuant** (Zandieh et al., 2025) paper on near-optimal vector quantization. The KV cache for full-attention layers is compressed from FP32 to 4-bit with asymmetric per-block quantization (block size = 64).
+
+### How it works
+
+- **Hybrid cache**: the most recent 64 tokens stay in full FP32 precision; older tokens are quantized to 4-bit (2 values per byte)
+- **Per-block scale + zero-point**: each block of 64 values gets its own scale factor and zero-point for asymmetric quantization
+- **Hadamard rotation** (optional, code ready): random rotation concentrates coordinate distribution, making scalar quantization near-optimal per TurboQuant theory
+- **10 full-attention layers** affected (out of 40 total; the other 30 use recurrent linear attention with no KV cache)
+
+### Memory savings
+
+| Configuration | KV cache per request | Total per 5 workers |
+|--------------|---------------------|---------------------|
+| FP32 (default) | 335.5 MB | ~1.7 GB |
+| **4-bit (`--kv-quant`)** | **48.5 MB** | **~242 MB** |
+| Compression ratio | **6.9×** | **7×** |
+
+### Usage
+
+```bash
+# Single request with KV quantization
+./infer --8bit --no-think --kv-quant --prompt "Hello" --tokens 100
+
+# Server mode with 5 concurrent workers + KV quantization
+./infer --8bit --no-think --kv-quant --serve-workers 5 --serve 8081
+```
+
+### Quality
+
+Tested with Indonesian and English prompts — output quality is indistinguishable from FP32 KV cache at 20.5 tok/s (no speed regression). Based on TurboQuant benchmarks: 4-bit achieves quality neutrality; 2.5-bit has marginal degradation.
+
+## Multi-Worker Concurrent Serving
+
+The `--serve-workers N` flag pre-forks N independent worker processes **before** Metal initialization. Each worker:
+
+- Has its own GPU context and KV cache
+- Binds to the same port via `SO_REUSEPORT` (kernel load-balances connections)
+- Serves requests independently — **no queueing between workers**
+
+```bash
+# 5 workers: 5 requests served simultaneously without queueing
+./infer --8bit --no-think --kv-quant --serve-workers 5 --serve 8081
+```
+
+### Concurrency benchmark (M4 Pro 24GB, Qwen3.6 8-bit)
+
+| Metric | 1 Worker (sequential) | 5 Workers (concurrent) |
+|--------|----------------------|------------------------|
+| Avg tok/s per-request | 12.0 | 5.8 |
+| Aggregate throughput | 13.6 tok/s | 13.4 tok/s |
+| Total wall time (5 requests) | 22.4s | 22.8s |
+| RAM per-request (FP32) | 335 MB | 335 MB |
+| RAM per-request (`--kv-quant`) | 48 MB | 48 MB |
+
+> **Note**: SSD I/O is the bottleneck for concurrent requests. Each worker streams experts from the same NVMe SSD, so aggregate throughput is capped by disk bandwidth. Workers benefit latency (no queue wait), not total throughput.
 
 ## 2-bit Expert Optimization
 
@@ -295,8 +358,9 @@ flash-moe/
   serve.sh                   # Server launcher with auto-restart
 
   metal_infer/
-    infer.m                  # Complete inference engine (~6500 lines Obj-C)
+    infer.m                  # Complete inference engine (~7000 lines Obj-C)
     shaders.metal            # Metal compute kernels
+    kv_quant.h               # 4-bit KV cache quantization (TurboQuant-inspired)
     chat.m                   # Interactive chat TUI (HTTP/SSE client)
     main.m                   # MoE-only benchmark harness
     Makefile                 # Build system
@@ -313,4 +377,5 @@ flash-moe/
 - Original [flash-moe](https://github.com/danveloper/flash-moe) by Dan Woods (danveloper)
 - Inspired by [Karpathy's autoresearch](https://github.com/karpathy) approach
 - Apple's ["LLM in a Flash: Efficient Large Language Model Inference with Limited Memory"](https://arxiv.org/abs/2312.11514) (Alizadeh et al., 2023)
+- KV cache quantization inspired by ["TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate"](https://arxiv.org/abs/2504.19874) (Zandieh et al., Google Research, 2025)
 - Models from the [MLX Community](https://huggingface.co/mlx-community) on HuggingFace
