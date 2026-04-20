@@ -232,7 +232,7 @@ static void cpu_dequant_matvec(const uint32_t *W, const uint16_t *scales, const 
 static void cpu_dequant_matvec_mxfp8(const uint32_t *W, const uint16_t *scales,
     const float *x, float *out, int out_dim, int in_dim, int group_size);
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
-static int g_think_budget = 2048; // max thinking tokens before force-emitting </think_>
+static int g_think_budget = -1; // max thinking tokens (-1=unlimited, 0=no thinking, N=N tokens)
 static int g_no_think = 0;       // suppress thinking tokens entirely (--no-think or request param)
 static int g_serve_workers = 1;  // number of pre-forked worker processes
 static int g_kv_quant = 0;       // quantize KV cache to 4-bit (--kv-quant)
@@ -6217,6 +6217,15 @@ static float extract_temperature(const char *buf) {
     if (!p) return -1.0f;
     return strtof(p + 1, NULL);
 }
+
+// Extract "think_budget" from JSON body. Returns -1 if not found.
+static int extract_think_budget(const char *buf) {
+    const char *p = strstr(buf, "\"think_budget\"");
+    if (!p) return -1;
+    p = strchr(p, ':');
+    if (!p) return -1;
+    return atoi(p + 1);
+}
 static void http_write(int fd, const char *data, int len) {
     int sent = 0;
     while (sent < len) {
@@ -7235,7 +7244,17 @@ static void serve_loop(
 
             // Per-request thinking control: override g_no_think if request specifies it
             int saved_no_think = g_no_think;
-            if (extract_no_think(body)) g_no_think = 1;
+            int saved_think_budget = g_think_budget;
+            if (extract_no_think(body)) {
+                g_no_think = 1;
+                g_think_budget = 0;  // disable thinking entirely
+            }
+            // Per-request think_budget override
+            int req_think_budget = extract_think_budget(body);
+            if (req_think_budget >= 0) {
+                g_think_budget = req_think_budget;
+                if (req_think_budget == 0) g_no_think = 1;
+            }
 
             // Per-request: JSON mode, stream mode
             int json_mode = extract_json_mode(body);
@@ -7506,7 +7525,7 @@ static void serve_loop(
                     if (next_token == THINK_END_TOKEN) in_think = 0;
                     if (in_think) {
                         think_tokens++;
-                        if (g_think_budget > 0 && think_tokens >= g_think_budget) {
+                        if (g_think_budget >= 0 && think_tokens >= g_think_budget) {
                             next_token = THINK_END_TOKEN;
                             in_think = 0;
                         }
@@ -7770,7 +7789,7 @@ static void serve_loop(
                 if (next_token == THINK_END_TOKEN) in_think = 0;
                 if (in_think) {
                     think_tokens++;
-                    if (g_think_budget > 0 && think_tokens >= g_think_budget) {
+                    if (g_think_budget >= 0 && think_tokens >= g_think_budget) {
                         next_token = THINK_END_TOKEN;  // force end thinking
                         in_think = 0;
                     }
@@ -7846,6 +7865,7 @@ static void serve_loop(
 
             // Restore per-request thinking override
             g_no_think = saved_no_think;
+            g_think_budget = saved_think_budget;
 
             // Cleanup non-streaming buffer
             if (g_ns_buf) { free(g_ns_buf); g_ns_buf = NULL; }
