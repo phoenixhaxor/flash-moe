@@ -694,17 +694,38 @@ static Vocabulary *load_vocab(const char *path) {
     return v;
 }
 
+// Thread-local buffer for BPE-decoded token strings
+static __thread char g_decode_buf[4096];
+
+// Decode GPT-2 BPE encoding: Ġ→space, Ċ→newline
+static const char *bpe_decode(const char *raw) {
+    if (!raw || !raw[0]) return raw;
+    char *dst = g_decode_buf;
+    const unsigned char *src = (const unsigned char *)raw;
+    while (*src && dst < g_decode_buf + sizeof(g_decode_buf) - 4) {
+        if (src[0] == 0xC4 && src[1] == 0xA0) {  // Ġ (U+0120) → space
+            *dst++ = ' '; src += 2;
+        } else if (src[0] == 0xC4 && src[1] == 0x8A) {  // Ċ (U+010A) → newline
+            *dst++ = '\n'; src += 2;
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+    return g_decode_buf;
+}
+
 static const char *decode_token(Vocabulary *v, int token_id) {
     // Handle special tokens not in vocab
     if (token_id == THINK_START_TOKEN) return "";  // suppress thinking markers
     if (token_id == THINK_END_TOKEN) return "";     // suppress thinking markers
-    if (token_id == 151643) return "";              // <|endoftext|> — suppress
+    if (token_id == 151643) return "";              // ▁ — suppress
     if (token_id == 248045) return "";              // <|im_start|> — suppress
     if (token_id == 248046) return "";              // <|im_end|> — suppress (also EOS)
     if (token_id < 0 || token_id >= v->num_tokens || !v->tokens[token_id]) {
         return "";  // unknown token — suppress instead of emitting <unk>
     }
-    return v->tokens[token_id];
+    return bpe_decode(v->tokens[token_id]);
 }
 
 // ============================================================================
