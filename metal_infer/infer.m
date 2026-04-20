@@ -238,6 +238,12 @@ static int g_serve_workers = 1;  // number of pre-forked worker processes
 static int g_kv_quant = 0;       // quantize KV cache to 4-bit (--kv-quant)
 static int g_speculative = 0;   // speculative decoding batch size (--speculative N, 0=off)
 
+// Non-streaming response buffer (per-request, thread-local)
+static __thread char *g_ns_buf = NULL;
+static __thread int g_ns_len = 0;
+static __thread int g_ns_cap = 0;
+static __thread int g_ns_streaming = 1;  // 1=streaming (default), 0=buffer
+
 // DFlash target hidden state capture — globals
 #define DFLASH_TARGET_LAYERS 5
 static const int g_dflash_target_layers[DFLASH_TARGET_LAYERS] = {1, 10, 19, 28, 37};
@@ -6182,7 +6188,35 @@ static int extract_no_think(const char *buf) {
     return 0;
 }
 
-// Write a full HTTP response string to fd
+// Extract "response_format": {"type": "json_object"} from JSON body. Returns 1 if JSON mode requested.
+static int extract_json_mode(const char *buf) {
+    const char *p = strstr(buf, "\"response_format\"");
+    if (!p) return 0;
+    p = strchr(p, '{');
+    if (!p) return 0;
+    // Look for "type":"json_object" or "type":"json"
+    const char *t = strstr(p, "\"type\"");
+    if (!t) return 0;
+    return (strstr(t, "\"json") != NULL) ? 1 : 0;
+}
+
+// Extract "stream" from JSON body. Returns 1 if explicitly "stream":true, 0 otherwise.
+static int extract_stream_mode(const char *buf) {
+    const char *p = strstr(buf, "\"stream\"");
+    if (!p) return 0;
+    p += 8; // skip "stream"
+    while (*p == ' ' || *p == '\t' || *p == ':' || *p == '\n' || *p == '\r') p++;
+    return (*p == 't') ? 1 : 0;  // true = streaming
+}
+
+// Extract temperature from JSON body. Returns -1.0 if not found.
+static float extract_temperature(const char *buf) {
+    const char *p = strstr(buf, "\"temperature\"");
+    if (!p) return -1.0f;
+    p = strchr(p, ':');
+    if (!p) return -1.0f;
+    return strtof(p + 1, NULL);
+}
 static void http_write(int fd, const char *data, int len) {
     int sent = 0;
     while (sent < len) {
@@ -6199,6 +6233,19 @@ static void http_write_str(int fd, const char *s) {
 // Send an SSE chunk with a token delta
 // Returns 0 on success, -1 if client disconnected
 static int sse_send_delta(int fd, const char *request_id, const char *token_text) {
+    // Non-streaming mode: buffer the token
+    if (!g_ns_streaming && g_ns_buf) {
+        int tlen = strlen(token_text);
+        while (g_ns_len + tlen + 1 >= g_ns_cap) {
+            g_ns_cap *= 2;
+            g_ns_buf = realloc(g_ns_buf, g_ns_cap);
+        }
+        memcpy(g_ns_buf + g_ns_len, token_text, tlen);
+        g_ns_len += tlen;
+        g_ns_buf[g_ns_len] = '\0';
+        return 0;
+    }
+    // Streaming mode: send SSE chunk
     char chunk[4096];
     // Escape the token text for JSON
     char escaped[2048];
@@ -6223,6 +6270,43 @@ static int sse_send_delta(int fd, const char *request_id, const char *token_text
 }
 
 static void sse_send_done(int fd, const char *request_id) {
+    if (!g_ns_streaming && g_ns_buf) {
+        // Non-streaming: send complete JSON response
+        char *escaped = NULL;
+        if (g_ns_len > 0) {
+            escaped = malloc(g_ns_len * 2 + 1);
+            char *w = escaped;
+            for (int i = 0; i < g_ns_len; i++) {
+                char c = g_ns_buf[i];
+                switch (c) {
+                    case '"':  *w++ = '\\'; *w++ = '"';  break;
+                    case '\\': *w++ = '\\'; *w++ = '\\'; break;
+                    case '\n': *w++ = '\\'; *w++ = 'n';  break;
+                    case '\r': *w++ = '\\'; *w++ = 'r';  break;
+                    case '\t': *w++ = '\\'; *w++ = 't';  break;
+                    default:   *w++ = c; break;
+                }
+            }
+            *w = '\0';
+        }
+        const char *content = escaped ? escaped : "";
+        char *resp = malloc(strlen(content) + 1024);
+        int n = snprintf(resp, strlen(content) + 1024,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Connection: close\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "\r\n"
+            "{\"id\":\"%s\",\"object\":\"chat.completion\","
+            "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},"
+            "\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n",
+            request_id, content);
+        http_write(fd, resp, n);
+        free(resp);
+        free(escaped);
+        return;
+    }
+    // Streaming: send SSE done
     char chunk[1024];
     int n = snprintf(chunk, sizeof(chunk),
         "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
@@ -7153,6 +7237,11 @@ static void serve_loop(
             int saved_no_think = g_no_think;
             if (extract_no_think(body)) g_no_think = 1;
 
+            // Per-request: JSON mode, stream mode
+            int json_mode = extract_json_mode(body);
+            int is_streaming = extract_stream_mode(body);
+            float req_temp = extract_temperature(body);
+
             // Extract user content from messages (mutates body — must be last)
             char *content = extract_last_content(body);
             if (!content || strlen(content) == 0) {
@@ -7161,6 +7250,19 @@ static void serve_loop(
                     "{\"error\":\"no content in messages\"}\n");
                 g_no_think = saved_no_think;
                 free(reqbuf); close(client_fd); continue;
+            }
+
+            // If JSON mode, inject JSON instruction into content and disable thinking
+            char *json_content = NULL;
+            if (json_mode) {
+                const char *json_prefix = "Respond with ONLY valid JSON. No markdown, no explanation, no text outside JSON.\n\n";
+                size_t plen = strlen(json_prefix);
+                size_t clen = strlen(content);
+                json_content = malloc(plen + clen + 1);
+                memcpy(json_content, json_prefix, plen);
+                memcpy(json_content + plen, content, clen + 1);
+                content = json_content;
+                g_no_think = 1;  // disable thinking for JSON mode
             }
             int is_continuation = (has_session &&
                                    active_session_id[0] != '\0' &&
@@ -7279,8 +7381,17 @@ static void serve_loop(
                 draft_forward_init();  // allocate CPU draft scratch buffers
             }
 
-            // ---- Send SSE headers ----
-            http_write_str(client_fd, SSE_HEADERS);
+            // ---- Send response headers (streaming or non-streaming) ----
+            if (is_streaming) {
+                g_ns_streaming = 1;
+                http_write_str(client_fd, SSE_HEADERS);
+            } else {
+                g_ns_streaming = 0;
+                g_ns_buf = malloc(65536);
+                g_ns_len = 0;
+                g_ns_cap = 65536;
+                g_ns_buf[0] = '\0';
+            }
 
             // ---- Batch prefill ----
             double t_prefill = now_ms();
@@ -7735,6 +7846,14 @@ static void serve_loop(
 
             // Restore per-request thinking override
             g_no_think = saved_no_think;
+
+            // Cleanup non-streaming buffer
+            if (g_ns_buf) { free(g_ns_buf); g_ns_buf = NULL; }
+            g_ns_len = 0; g_ns_cap = 0;
+            g_ns_streaming = 1;  // reset to default
+
+            // Cleanup JSON mode buffer
+            if (json_content) { free(json_content); json_content = NULL; }
 
             free(reqbuf);
             close(client_fd);
