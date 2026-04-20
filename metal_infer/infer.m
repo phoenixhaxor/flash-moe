@@ -238,6 +238,13 @@ static int g_serve_workers = 1;  // number of pre-forked worker processes
 static int g_kv_quant = 0;       // quantize KV cache to 4-bit (--kv-quant)
 static int g_speculative = 0;   // speculative decoding batch size (--speculative N, 0=off)
 
+// DFlash target hidden state capture — globals
+#define DFLASH_TARGET_LAYERS 5
+static const int g_dflash_target_layers[DFLASH_TARGET_LAYERS] = {1, 10, 19, 28, 37};
+static float *g_dflash_hidden_buf = NULL;   // [seq_len * HIDDEN_DIM * DFLASH_TARGET_LAYERS]
+static int g_dflash_hidden_len = 0;         // captured positions
+static int g_dflash_capture = 0;            // 1 = capture mode active
+
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [NUM_LAYERS] cold fds (set in main)
 static uint8_t g_expert_seen[NUM_LAYERS][NUM_EXPERTS / 8];  // bitset: seen before?
@@ -573,6 +580,11 @@ typedef struct {
     size_t size;
     TensorManifest *manifest;
 } WeightFile;
+
+// Forward declaration for DFlash draft model (implemented in draft_dflash.c)
+int dflash_forward(WeightFile *wf, const float *target_hidden, int seq_len,
+                   int staged_first_token, int current_pos,
+                   int *out_draft_tokens, float *out_draft_logits);
 
 static WeightFile *open_weights(const char *bin_path, const char *json_path) {
     // mmap the binary file
@@ -1065,8 +1077,10 @@ static int cpu_argmax(const float *x, int dim) {
 // Suppress thinking token in logits (disabled — let model decide via /no_think system prompt)
 // Previously set logits[THINK_START_TOKEN] = -inf, which caused gibberish output.
 static void suppress_think_token(float *logits) {
-    // No-op: Qwen3.6 models respect /no_think in system prompt natively.
-    // Filtering of thinking tokens is done in the output stage, not logits.
+    // No-op: Do not suppress thinking via logits.
+    // Thinking tokens are filtered from SSE output by the in_think tracker.
+    // Use --think-budget N (or -B N) to cap thinking tokens.
+    // Production default: -B 1 caps thinking to 1 token, effectively disabling it.
 }
 
 // SiLU activation
@@ -6884,6 +6898,7 @@ static void serve_loop(
 {
     // Ignore SIGPIPE (client disconnect mid-write)
     signal(SIGPIPE, SIG_IGN);
+    fprintf(stderr, "[serve_loop] g_speculative=%d, g_serve_workers=%d, pid=%d\n", g_speculative, g_serve_workers, getpid());
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) { perror("socket"); return; }
@@ -7238,6 +7253,14 @@ static void serve_loop(
             }
             if (g_cache_telemetry_enabled) cache_telemetry_reset();
 
+            // ---- DFlash: Initialize hidden capture buffer before prefill ----
+            if (g_speculative > 0) {
+                int max_capture = 2048;
+                g_dflash_hidden_buf = calloc((size_t)max_capture * DFLASH_TARGET_LAYERS * HIDDEN_DIM, sizeof(float));
+                g_dflash_hidden_len = 0;
+                g_dflash_capture = 1;
+            }
+
             // ---- Send SSE headers ----
             http_write_str(client_fd, SSE_HEADERS);
 
@@ -7268,6 +7291,19 @@ static void serve_loop(
                                         pos,
                                         layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
                                         K, layer_fds[layer]);
+                    // DFlash: capture hidden states during prefill
+                    if (g_dflash_hidden_buf && g_dflash_capture) {
+                        for (int ti = 0; ti < DFLASH_TARGET_LAYERS; ti++) {
+                            if (layer == g_dflash_target_layers[ti]) {
+                                int off = g_dflash_hidden_len * DFLASH_TARGET_LAYERS * HIDDEN_DIM
+                                        + ti * HIDDEN_DIM;
+                                memcpy(g_dflash_hidden_buf + off, hidden, HIDDEN_DIM * sizeof(float));
+                            }
+                        }
+                        if (layer == g_dflash_target_layers[DFLASH_TARGET_LAYERS - 1]) {
+                            g_dflash_hidden_len++;
+                        }
+                    }
                 }
                 discard_deferred_experts();
                 pos++;
@@ -7289,6 +7325,19 @@ static void serve_loop(
                                         pos,
                                         layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
                                         K, layer_fds[layer]);
+                    // DFlash: capture hidden states during prefill (last token too)
+                    if (g_dflash_hidden_buf && g_dflash_capture) {
+                        for (int ti = 0; ti < DFLASH_TARGET_LAYERS; ti++) {
+                            if (layer == g_dflash_target_layers[ti]) {
+                                int off = g_dflash_hidden_len * DFLASH_TARGET_LAYERS * HIDDEN_DIM
+                                        + ti * HIDDEN_DIM;
+                                memcpy(g_dflash_hidden_buf + off, hidden, HIDDEN_DIM * sizeof(float));
+                            }
+                        }
+                        if (layer == g_dflash_target_layers[DFLASH_TARGET_LAYERS - 1]) {
+                            g_dflash_hidden_len++;
+                        }
+                    }
                 }
                 complete_deferred_experts();
                 pos++;
@@ -7323,41 +7372,35 @@ static void serve_loop(
             // model (greedy), snapshot state before verify, run batched verify,
             // and rollback on partial rejection.
             // Phase 2 adds: KV cache + GDN state snapshots, partial acceptance + rollback.
-            if (g_speculative > 0 && g_speculative <= VERIFY_MAX_TOKENS) {
-                draft_forward_init();  // allocate CPU draft scratch buffers
-                int spec_N = g_speculative;
-                float *verify_logits = calloc((size_t)spec_N * VOCAB_SIZE, sizeof(float));
-                int *draft_tokens = calloc(spec_N, sizeof(int));
+            if (g_speculative > 0) {
+                fprintf(stderr, "[dflash] ENTERING speculative path, g_speculative=%d\n", g_speculative);
+                // ---- DFlash Speculative Decoding ----
+                // Uses cross-attention draft model conditioned on target hidden states.
+                // Draft produces 15 tokens per cycle, verified against target model.
+                #define DFLASH_BLOCK 15
+                int *draft_tokens = calloc(DFLASH_BLOCK, sizeof(int));
 
-                // Pre-allocate GDN state snapshot buffers (reused each iteration)
-                size_t conv_state_size = (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM * sizeof(float);
-                size_t ssm_state_size = LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float);
-                float *snap_conv = malloc(conv_state_size * NUM_LAYERS);   // flat buffer for all layers
-                float *snap_ssm  = malloc(ssm_state_size * NUM_LAYERS);    // flat buffer for all layers
-                int snap_kv_lens[NUM_LAYERS];  // KV cache lengths before draft
-
-                fprintf(stderr, "[speculative] enabled, batch_size=%d\n", spec_N);
+                fprintf(stderr, "[dflash] speculative enabled (block=%d)\n", DFLASH_BLOCK);
 
                 while (gen_count < max_gen) {
-                    // Check EOS
+                    // Check EOS on staged token
                     if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) {
-                        cache_telemetry_note_token();
                         embed_lookup(wf, next_token, hidden);
                         for (int layer = 0; layer < NUM_LAYERS; layer++) {
                             int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
                             fused_layer_forward(wf, layer, hidden,
                                                 is_full ? kv_caches[layer] : NULL,
-                                                is_full ? NULL : (LinearAttnState *)layer_states[layer],
+                                                is_full ? NULL : layer_states[layer],
                                                 pos,
                                                 layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
                                                 K, layer_fds[layer]);
                         }
-                        discard_deferred_experts();
+                        complete_deferred_experts();
                         pos++;
                         break;
                     }
 
-                    // Think budget enforcement
+                    // Think budget
                     if (next_token == THINK_START_TOKEN) in_think = 1;
                     if (next_token == THINK_END_TOKEN) in_think = 0;
                     if (in_think) {
@@ -7368,7 +7411,7 @@ static void serve_loop(
                         }
                     }
 
-                    // Emit the first token (already verified from previous iteration)
+                    // Emit the staged token
                     const char *tok_str = decode_token(vocab, next_token);
                     if (!in_think && tok_str[0] != '\0' && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
                         int tlen = (int)strlen(tok_str);
@@ -7376,7 +7419,6 @@ static void serve_loop(
                         gen_resp_len += tlen;
                         gen_response[gen_resp_len] = 0;
                     }
-                    // Only send non-thinking, non-empty tokens via SSE
                     if (tok_str[0] != '\0' && !in_think) {
                         if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
                             fprintf(stderr, "[serve] %s client disconnected\n", request_id);
@@ -7385,13 +7427,14 @@ static void serve_loop(
                     }
                     gen_count++;
 
-                    // ---- Snapshot state before draft generation ----
-                    // Save KV cache lengths (for truncation on rejection)
+                    // ---- Snapshot state before draft ----
+                    size_t conv_state_size = (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM * sizeof(float);
+                    size_t ssm_state_size = LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float);
+                    float *snap_conv = malloc(conv_state_size * NUM_LAYERS);
+                    float *snap_ssm  = malloc(ssm_state_size * NUM_LAYERS);
+                    int snap_kv_lens[NUM_LAYERS];
                     for (int i = 0; i < NUM_LAYERS; i++) {
                         snap_kv_lens[i] = kv_caches[i] ? kv_caches[i]->len : 0;
-                    }
-                    // Save GDN linear attention states (conv + ssm) for all layers
-                    for (int i = 0; i < NUM_LAYERS; i++) {
                         if (layer_states[i]) {
                             LinearAttnState *s = (LinearAttnState *)layer_states[i];
                             memcpy(snap_conv + (size_t)i * (conv_state_size / sizeof(float)),
@@ -7400,100 +7443,165 @@ static void serve_loop(
                                    s->ssm_state, ssm_state_size);
                         }
                     }
-                    int snap_pos = pos;
-
-                    // ---- Generate N draft tokens (reduced-expert draft for speedup) ----
-                    // Uses target model with fewer active experts (K_draft = max(1, K/2))
-                    // for faster SSD I/O while keeping high acceptance rate.
-                    // Verification uses full K experts.
-                    int n_draft = 0;
-                    int draft_pos = pos;
-                    int K_draft = (K > 2) ? (K / 2) : 1;  // half the experts, minimum 1
-                    if (K_draft >= K) K_draft = K - 1;     // ensure draft is actually cheaper
-                    if (K_draft < 1) K_draft = 1;
-
-                    for (int d = 0; d < spec_N && gen_count + n_draft < max_gen; d++) {
-                        cache_telemetry_note_token();
-                        embed_lookup(wf, next_token, hidden);
-                        for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                            int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
-                            fused_layer_forward(wf, layer, hidden,
-                                                is_full ? kv_caches[layer] : NULL,
-                                                is_full ? NULL : (LinearAttnState *)layer_states[layer],
-                                                draft_pos,
-                                                layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                                K_draft, layer_fds[layer]);
-                        }
-                        complete_deferred_experts();
-                        draft_pos++;
-
-                        if (final_norm_w) {
-                            float *dnorm = malloc(HIDDEN_DIM * sizeof(float));
-                            cpu_rms_norm(hidden, final_norm_w, dnorm, HIDDEN_DIM, RMS_NORM_EPS);
-                            memcpy(hidden, dnorm, HIDDEN_DIM * sizeof(float));
-                            free(dnorm);
-                        }
-                        lm_head_forward(wf, hidden, logits);
-                        suppress_think_token(logits);
-                        next_token = cpu_argmax(logits, VOCAB_SIZE);
-
-                        if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) break;
-                        draft_tokens[n_draft++] = next_token;
+                    // Also snapshot quantized KV cache lengths
+                    int snap_qk_lens[NUM_LAYERS], snap_qv_lens[NUM_LAYERS];
+                    for (int i = 0; i < NUM_LAYERS; i++) {
+                        HybridKVCache *kc = kv_caches[i];
+                        snap_qk_lens[i] = kc ? kc->qk->len : 0;
+                        snap_qv_lens[i] = kc ? kc->qv->len : 0;
                     }
+                    int snap_pos = pos;
+                    int snap_hidden_len = g_dflash_hidden_len;
 
-                    if (n_draft == 0) break;
-
-                    // ---- Accept draft tokens (reduced-expert speculative) ----
-                    // Since we use the same model with K_draft < K, acceptance rate
-                    // is typically 60-80% for greedy decoding.
-                    // For now, trust all draft tokens and advance pos.
-                    // The speedup comes from fewer SSD expert reads during draft.
-                    // Note: This produces slightly different output than pure K=4.
-                    int n_accepted = n_draft;
-
-                    g_verify_calls++;
-                    g_verify_total_drafted += n_draft;
-                    g_verify_total_accepted += n_accepted;
-
-                    pos = draft_pos;
-
-                    // Emit accepted draft tokens
-                    for (int a = 0; a < n_accepted && gen_count < max_gen; a++) {
-                        if (draft_tokens[a] == THINK_START_TOKEN) in_think = 1;
-                        if (draft_tokens[a] == THINK_END_TOKEN) in_think = 0;
-
-                        const char *ds = decode_token(vocab, draft_tokens[a]);
-                        if (!in_think && ds[0] != '\0' && gen_resp_len + (int)strlen(ds) < 256*1024 - 1) {
-                            int dlen = (int)strlen(ds);
-                            memcpy(gen_response + gen_resp_len, ds, dlen);
-                            gen_resp_len += dlen;
-                            gen_response[gen_resp_len] = 0;
-                        }
-                        // Only send non-thinking, non-empty tokens via SSE
-                        if (ds[0] != '\0' && !in_think) {
-                            if (sse_send_delta(client_fd, request_id, ds) < 0) {
-                                fprintf(stderr, "[serve] %s client disconnected\n", request_id);
-                                goto spec_done;
+                    // ---- Run target model on staged token (captures hidden states) ----
+                    cache_telemetry_note_token();
+                    embed_lookup(wf, next_token, hidden);
+                    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                        int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                        fused_layer_forward(wf, layer, hidden,
+                                            is_full ? kv_caches[layer] : NULL,
+                                            is_full ? NULL : layer_states[layer],
+                                            pos,
+                                            layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                            K, layer_fds[layer]);
+                        // DFlash: capture hidden state at target layers
+                        if (g_dflash_hidden_buf) {
+                            for (int ti = 0; ti < DFLASH_TARGET_LAYERS; ti++) {
+                                if (layer == g_dflash_target_layers[ti]) {
+                                    int off = g_dflash_hidden_len * DFLASH_TARGET_LAYERS * HIDDEN_DIM
+                                            + ti * HIDDEN_DIM;
+                                    memcpy(g_dflash_hidden_buf + off, hidden, HIDDEN_DIM * sizeof(float));
+                                }
+                            }
+                            if (layer == g_dflash_target_layers[DFLASH_TARGET_LAYERS - 1]) {
+                                g_dflash_hidden_len++;
                             }
                         }
-                        gen_count++;
+                    }
+                    complete_deferred_experts();
+                    pos++;
+
+                    // Get target logits for staged token → this is verify[0]
+                    if (final_norm_w) {
+                        float *normed = malloc(HIDDEN_DIM * sizeof(float));
+                        cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
+                        memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
+                        free(normed);
+                    }
+                    lm_head_forward(wf, hidden, logits);
+                    suppress_think_token(logits);
+                    int verify_token = cpu_argmax(logits, VOCAB_SIZE);
+
+                    // ---- Call DFlash draft model ----
+                    int n_drafted = 0;
+                    int dflash_ok = dflash_forward(wf,
+                        g_dflash_hidden_buf, g_dflash_hidden_len,
+                        next_token, pos,
+                        draft_tokens, NULL);
+                    if (dflash_ok == 0) {
+                        n_drafted = DFLASH_BLOCK;
+                    }
+                    fprintf(stderr, "[dflash] forward ok=%d, hidden_len=%d, n_drafted=%d, "
+                            "staged=%d, verify[0]=%d, draft[0]=%d\n",
+                            dflash_ok, g_dflash_hidden_len, n_drafted,
+                            next_token, verify_token,
+                            n_drafted > 0 ? draft_tokens[0] : -1);
+
+                    // ---- Verify draft tokens against target model ----
+                    int n_accepted = 0;
+
+                    for (int d = 0; d < n_drafted && gen_count + n_accepted < max_gen; d++) {
+                        if (draft_tokens[d] == verify_token) {
+                            // Accept this draft token
+                            n_accepted++;
+
+                            // Track think state for accepted token
+                            if (draft_tokens[d] == THINK_START_TOKEN) in_think = 1;
+                            if (draft_tokens[d] == THINK_END_TOKEN) in_think = 0;
+
+                            // Emit accepted token to SSE
+                            tok_str = decode_token(vocab, draft_tokens[d]);
+                            if (!in_think && tok_str[0] != '\0' && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
+                                int tlen = (int)strlen(tok_str);
+                                memcpy(gen_response + gen_resp_len, tok_str, tlen);
+                                gen_resp_len += tlen;
+                                gen_response[gen_resp_len] = 0;
+                            }
+                            if (tok_str[0] != '\0' && !in_think) {
+                                if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
+                                    fprintf(stderr, "[serve] %s client disconnected during accept\n", request_id);
+                                    goto dflash_done;
+                                }
+                            }
+
+                            // Run target model on accepted token to get next verify
+                            cache_telemetry_note_token();
+                            embed_lookup(wf, draft_tokens[d], hidden);
+                            for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                                int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                                fused_layer_forward(wf, layer, hidden,
+                                                    is_full ? kv_caches[layer] : NULL,
+                                                    is_full ? NULL : layer_states[layer],
+                                                    pos,
+                                                    layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                                    K, layer_fds[layer]);
+                                // Capture hidden for next draft iteration
+                                if (g_dflash_hidden_buf) {
+                                    for (int ti = 0; ti < DFLASH_TARGET_LAYERS; ti++) {
+                                        if (layer == g_dflash_target_layers[ti]) {
+                                            int off = g_dflash_hidden_len * DFLASH_TARGET_LAYERS * HIDDEN_DIM
+                                                    + ti * HIDDEN_DIM;
+                                            memcpy(g_dflash_hidden_buf + off, hidden, HIDDEN_DIM * sizeof(float));
+                                        }
+                                    }
+                                    if (layer == g_dflash_target_layers[DFLASH_TARGET_LAYERS - 1]) {
+                                        g_dflash_hidden_len++;
+                                    }
+                                }
+                            }
+                            complete_deferred_experts();
+                            pos++;
+
+                            if (final_norm_w) {
+                                float *normed = malloc(HIDDEN_DIM * sizeof(float));
+                                cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
+                                memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
+                                free(normed);
+                            }
+                            lm_head_forward(wf, hidden, logits);
+                            suppress_think_token(logits);
+                            verify_token = cpu_argmax(logits, VOCAB_SIZE);
+                        } else {
+                            // Rejection — bonus token is verify_token
+                            break;
+                        }
                     }
 
-                    // Check EOS
-                    if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) break;
+                    gen_count += n_accepted;
+                    fprintf(stderr, "[dflash] accepted=%d/%d, next_verify=%d\n",
+                            n_accepted, n_drafted, verify_token);
+
+                    // Set next_token = bonus token (target's choice after last accepted)
+                    next_token = verify_token;
+
+                    // Check EOS on bonus token
+                    if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) {
+                        free(snap_conv);
+                        free(snap_ssm);
+                        break;
+                    }
+
+                    free(snap_conv);
+                    free(snap_ssm);
                 }
 
-                spec_done:
-                free(verify_logits);
+            dflash_done:
+                g_dflash_capture = 0;
+                free(g_dflash_hidden_buf);
+                g_dflash_hidden_buf = NULL;
                 free(draft_tokens);
-                free(snap_conv);
-                free(snap_ssm);
 
-                if (g_verify_calls > 0) {
-                    fprintf(stderr, "[speculative] stats: %d calls, %d/%d accepted (%.1f%%)\n",
-                            g_verify_calls, g_verify_total_accepted, g_verify_total_drafted,
-                            g_verify_total_drafted > 0 ? 100.0 * g_verify_total_accepted / g_verify_total_drafted : 0.0);
-                }
+                fprintf(stderr, "[dflash] speculative loop done, gen_count=%d\n", gen_count);
             } else
             // ---- Standard decode loop (no speculative) ----
             {
@@ -7555,6 +7663,20 @@ static void serve_loop(
                                         pos,
                                         layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
                                         K, layer_fds[layer]);
+                // DFlash: capture target hidden states at target layers
+                if (g_dflash_capture && g_dflash_hidden_buf) {
+                    for (int ti = 0; ti < DFLASH_TARGET_LAYERS; ti++) {
+                        if (layer == g_dflash_target_layers[ti]) {
+                            int off = g_dflash_hidden_len * DFLASH_TARGET_LAYERS * HIDDEN_DIM
+                                    + ti * HIDDEN_DIM;
+                            memcpy(g_dflash_hidden_buf + off, hidden, HIDDEN_DIM * sizeof(float));
+                        }
+                    }
+                    // After all target layers captured for this position, increment
+                    if (layer == g_dflash_target_layers[DFLASH_TARGET_LAYERS - 1]) {
+                        g_dflash_hidden_len++;
+                    }
+                }
                 }
                 complete_deferred_experts();
                 pos++;
@@ -7717,6 +7839,7 @@ int main(int argc, char **argv) {
                 case 'W': g_serve_workers = atoi(optarg); if (g_serve_workers < 1) g_serve_workers = 1; break;
                 case 'Q': g_kv_quant = 1; break;
                 case 'Z': g_speculative = atoi(optarg);
+                          fprintf(stderr, "[speculative] set to %d (from optarg=%s)\n", g_speculative, optarg ? optarg : "NULL");
                           if (g_speculative < 0) g_speculative = 0;
                           if (g_speculative > VERIFY_MAX_TOKENS) g_speculative = VERIFY_MAX_TOKENS;
                           break;
@@ -8269,3 +8392,9 @@ int main(int argc, char **argv) {
     }
 }
 #endif // CHAT_MODE
+
+// ============================================================================
+// DFlash Speculative Decoding — include implementation
+// ============================================================================
+#define DFLASH_IMPL
+#include "draft_dflash.c"
